@@ -13,6 +13,12 @@ import {
 
 type CadenceKind = 'project' | 'workstream' | 'task';
 type CycleStatus = 'open' | 'closed';
+type CadenceType =
+  | 'daily'
+  | 'weekly'
+  | 'biweekly'
+  | 'monthly'
+  | 'quarterly';
 
 interface CadenceCycle {
   id: string;
@@ -31,11 +37,13 @@ interface CadenceNode {
   kind: CadenceKind;
   parentId?: string; // undefined for top-level projects
   name: string;
-  cadence: 'weekly' | 'monthly' | 'quarterly';
+  cadence: CadenceType;
   cycles: CadenceCycle[];
 }
 
-type ViewMode = 'entry' | 'review' | 'owners';
+type ViewMode = 'entry' | 'review' | 'owners' | 'open';
+
+type DueState = 'ontime' | 'duesoon' | 'overdue';
 
 interface AppState {
   nodes: CadenceNode[];
@@ -45,6 +53,12 @@ interface AppState {
   viewMode: ViewMode;
   activeOwner?: string;
   ownerVisibleNodeIds: string[];
+
+  // Filters for Open mode
+  openOwnerFilter?: string;
+  openKindFilter: 'all' | CadenceKind;
+  openCadenceFilter: 'all' | CadenceType;
+  openDueFilter: 'all' | DueState;
 }
 
 // ---- Initial sample state ----
@@ -229,6 +243,11 @@ const initialState: AppState = {
   viewMode: 'entry',
   activeOwner: undefined,
   ownerVisibleNodeIds: [],
+
+  openOwnerFilter: undefined,
+  openKindFilter: 'all',
+  openCadenceFilter: 'all',
+  openDueFilter: 'all',
 };
 
 // ---- Helper functions ----
@@ -237,18 +256,70 @@ function getProjects(nodes: CadenceNode[]): CadenceNode[] {
   return nodes.filter((n) => n.kind === 'project');
 }
 
-function getWorkstreams(nodes: CadenceNode[], projectId?: string): CadenceNode[] {
-  if (!projectId) return [];
+function getWorkstreamsForProject(
+  nodes: CadenceNode[],
+  projectId: string | undefined
+): CadenceNode[] {
+  if (!projectId) return nodes.filter((n) => n.kind === 'workstream');
   return nodes.filter(
     (n) => n.kind === 'workstream' && n.parentId === projectId
   );
 }
 
-function getTasks(nodes: CadenceNode[], workstreamId?: string): CadenceNode[] {
-  if (!workstreamId) return [];
+function getAllWorkstreams(nodes: CadenceNode[]): CadenceNode[] {
+  return nodes.filter((n) => n.kind === 'workstream');
+}
+
+function getTasksForWorkstream(
+  nodes: CadenceNode[],
+  workstreamId: string | undefined
+): CadenceNode[] {
+  if (!workstreamId) return nodes.filter((n) => n.kind === 'task');
   return nodes.filter(
     (n) => n.kind === 'task' && n.parentId === workstreamId
   );
+}
+
+function getTasksForProject(
+  nodes: CadenceNode[],
+  projectId: string | undefined
+): CadenceNode[] {
+  if (!projectId) return nodes.filter((n) => n.kind === 'task');
+  const workstreams = nodes.filter(
+    (n) => n.kind === 'workstream' && n.parentId === projectId
+  );
+  const wsIds = new Set(workstreams.map((w) => w.id));
+  return nodes.filter(
+    (n) => n.kind === 'task' && n.parentId && wsIds.has(n.parentId)
+  );
+}
+
+// Centralised visibility logic for Tasks in Entry/Review
+function getVisibleTasksForEntryReview(
+  nodes: CadenceNode[],
+  activeProjectId: string | undefined,
+  activeWorkstreamId: string | undefined,
+  inOwnersMode: boolean
+): CadenceNode[] {
+  if (inOwnersMode) {
+    // In Owners mode, ALL pills are disabled for hierarchy,
+    // and we simply show all tasks as selectors.
+    return nodes.filter((n) => n.kind === 'task');
+  }
+
+  // If a specific Workstream is selected → tasks under that workstream
+  if (activeWorkstreamId) {
+    return getTasksForWorkstream(nodes, activeWorkstreamId);
+  }
+
+  // If a specific Project is selected (and WS = ALL, Tasks = ALL)
+  // → tasks under all workstreams of that project
+  if (activeProjectId) {
+    return getTasksForProject(nodes, activeProjectId);
+  }
+
+  // ALL Projects, ALL Workstreams, ALL Tasks → all tasks
+  return nodes.filter((n) => n.kind === 'task');
 }
 
 // generic children
@@ -282,11 +353,16 @@ function getCurrentCycle(node: CadenceNode): CadenceCycle {
 }
 
 // Past cycles for history
-function getPastCycles(node: CadenceNode, current: CadenceCycle): CadenceCycle[] {
+function getPastCycles(
+  node: CadenceNode,
+  current: CadenceCycle
+): CadenceCycle[] {
   return node.cycles.filter((c: CadenceCycle) => c.id !== current.id);
 }
 
 // ---- Date helpers ----
+
+const MS_PER_DAY = 1000 * 60 * 60 * 24;
 
 function parseISODate(dateStr: string): Date {
   return new Date(dateStr + 'T00:00:00');
@@ -296,10 +372,14 @@ function formatISODate(date: Date): string {
   return date.toISOString().slice(0, 10);
 }
 
-function getPeriodLengthDays(cadence: CadenceNode['cadence']): number {
+function getPeriodLengthDays(cadence: CadenceType): number {
   switch (cadence) {
+    case 'daily':
+      return 1;
     case 'weekly':
       return 7;
+    case 'biweekly':
+      return 14;
     case 'monthly':
       return 30;
     case 'quarterly':
@@ -344,6 +424,51 @@ function getNextPeriodRange(
   return undefined;
 }
 
+// Target end date for an open cycle
+function getTargetEndDate(
+  node: CadenceNode,
+  cycle: CadenceCycle
+): Date | undefined {
+  if (cycle.endDate) {
+    return parseISODate(cycle.endDate);
+  }
+  if (cycle.startDate) {
+    const len = getPeriodLengthDays(node.cadence);
+    const start = parseISODate(cycle.startDate);
+    return addDays(start, len - 1);
+  }
+  return undefined;
+}
+
+// Due-state calculation for open cycles
+function getDueStateForCycle(
+  node: CadenceNode,
+  cycle: CadenceCycle,
+  today: Date
+): DueState {
+  if (cycle.status !== 'open') return 'ontime';
+
+  const targetEnd = getTargetEndDate(node, cycle);
+  if (!targetEnd) {
+    return 'ontime';
+  }
+
+  const diffDays = Math.floor(
+    (targetEnd.getTime() - today.getTime()) / MS_PER_DAY
+  );
+
+  if (diffDays < 0) {
+    return 'overdue';
+  }
+
+  // "Due soon" if within 2 days of target end
+  if (diffDays <= 2) {
+    return 'duesoon';
+  }
+
+  return 'ontime';
+}
+
 // ---- Close period ----
 
 function closeCurrentCycle(node: CadenceNode): CadenceNode {
@@ -380,10 +505,14 @@ function closeCurrentCycle(node: CadenceNode): CadenceNode {
 
 // ---- PPP helpers ----
 
-function getCadenceLabel(cadence: CadenceNode['cadence']): string {
+function getCadenceLabel(cadence: CadenceType): string {
   switch (cadence) {
+    case 'daily':
+      return 'day';
     case 'weekly':
       return 'week';
+    case 'biweekly':
+      return 'two weeks';
     case 'monthly':
       return 'month';
     case 'quarterly':
@@ -513,6 +642,7 @@ interface PPPRowProps {
   cycle: CadenceCycle;
   editable: boolean;
   onUpdateField?: (field: 'actuals' | 'nextPlan', value: string) => void;
+  statusLabel?: string; // e.g., "Overdue · 2025-01-01 → 2025-01-07"
 }
 
 const PPPRow: React.FC<PPPRowProps> = ({
@@ -520,21 +650,36 @@ const PPPRow: React.FC<PPPRowProps> = ({
   cycle,
   editable,
   onUpdateField,
+  statusLabel,
 }) => {
   const labelPrefix = getNodeLabelPrefix(node.kind);
   const objectLabel = `${labelPrefix}: ${node.name}`;
 
   const canEdit = editable && cycle.status === 'open' && !!onUpdateField;
 
+  const ownerLine = (() => {
+    const owner = (cycle.owner || '').trim();
+    if (owner && statusLabel) {
+      return `Owner: ${owner} · ${statusLabel}`;
+    }
+    if (owner) {
+      return `Owner: ${owner}`;
+    }
+    if (statusLabel) {
+      return statusLabel;
+    }
+    return '';
+  })();
+
   return (
     <View style={styles.pppRow}>
-      {/* Object + Owner (always read-only) */}
+      {/* Object + Owner/Status (always read-only) */}
       <View style={[styles.pppObjectCell, styles.fieldInputPast]}>
         <Text style={[styles.pastFieldText, styles.pppObjectText]}>
           {objectLabel}
         </Text>
-        {cycle.owner ? (
-          <Text style={styles.ownerInline}>Owner: {cycle.owner}</Text>
+        {ownerLine ? (
+          <Text style={styles.ownerInline}>{ownerLine}</Text>
         ) : null}
       </View>
 
@@ -729,20 +874,6 @@ const ReviewSection: React.FC<ReviewSectionProps> = ({
     ? `Next Plan (next ${cadenceLabel}: ${nextRange.start} → ${nextRange.end})`
     : `Next Plan (for the next ${cadenceLabel})`;
 
-  let children: CadenceNode[] = [];
-  let childrenLabel = '';
-
-  if (currentNode.kind === 'project') {
-    children = getWorkstreams(nodes, currentNode.id);
-    childrenLabel = 'Workstreams under this Project';
-  } else if (currentNode.kind === 'workstream') {
-    children = getTasks(nodes, currentNode.id);
-    childrenLabel = 'Tasks under this Workstream';
-  } else {
-    children = [];
-    childrenLabel = '';
-  }
-
   return (
     <View style={styles.section}>
       <Text style={styles.sectionTitle}>Review</Text>
@@ -771,26 +902,75 @@ const ReviewSection: React.FC<ReviewSectionProps> = ({
         }
       />
 
-      {/* Children rows (editable if their current period is open) */}
-      {childrenLabel && (
-        <Text style={[styles.cycleMetaSmall, { marginTop: 8 }]}>
-          {childrenLabel}
-        </Text>
+      {/* Children rows (and grandchildren for project) */}
+      {currentNode.kind === 'project' && (
+        <>
+          <Text style={[styles.cycleMetaSmall, { marginTop: 8 }]}>
+            Workstreams and Tasks under this Project
+          </Text>
+          {getWorkstreamsForProject(nodes, currentNode.id).map((ws) => {
+            const wsCycle = getCurrentCycle(ws);
+            const wsTasks = nodes.filter(
+              (n) => n.kind === 'task' && n.parentId === ws.id
+            );
+
+            return (
+              <View key={ws.id}>
+                {/* Workstream row */}
+                <PPPRow
+                  node={ws}
+                  cycle={wsCycle}
+                  editable={wsCycle.status === 'open'}
+                  onUpdateField={(field, value) =>
+                    onUpdateField(ws.id, field, value)
+                  }
+                />
+                {/* Tasks under this workstream */}
+                {wsTasks.map((task) => {
+                  const tCycle = getCurrentCycle(task);
+                  return (
+                    <PPPRow
+                      key={task.id}
+                      node={task}
+                      cycle={tCycle}
+                      editable={tCycle.status === 'open'}
+                      onUpdateField={(field, value) =>
+                        onUpdateField(task.id, field, value)
+                      }
+                    />
+                  );
+                })}
+              </View>
+            );
+          })}
+        </>
       )}
-      {children.map((child) => {
-        const childCycle = getCurrentCycle(child);
-        return (
-          <PPPRow
-            key={child.id}
-            node={child}
-            cycle={childCycle}
-            editable={childCycle.status === 'open'}
-            onUpdateField={(field, value) =>
-              onUpdateField(child.id, field, value)
-            }
-          />
-        );
-      })}
+
+      {currentNode.kind === 'workstream' && (
+        <>
+          <Text style={[styles.cycleMetaSmall, { marginTop: 8 }]}>
+            Tasks under this Workstream
+          </Text>
+          {nodes
+            .filter(
+              (n) => n.kind === 'task' && n.parentId === currentNode.id
+            )
+            .map((task) => {
+              const tCycle = getCurrentCycle(task);
+              return (
+                <PPPRow
+                  key={task.id}
+                  node={task}
+                  cycle={tCycle}
+                  editable={tCycle.status === 'open'}
+                  onUpdateField={(field, value) =>
+                    onUpdateField(task.id, field, value)
+                  }
+                />
+              );
+            })}
+        </>
+      )}
     </View>
   );
 };
@@ -858,6 +1038,87 @@ const OwnersOverviewSection: React.FC<OwnersOverviewSectionProps> = ({
   );
 };
 
+// ---- Open mode section (All open PPPs) ----
+
+interface OpenEntry {
+  node: CadenceNode;
+  cycle: CadenceCycle;
+  dueState: DueState;
+  targetEnd?: Date;
+}
+
+interface OpenModeSectionProps {
+  entries: OpenEntry[];
+  onUpdateField: (
+    nodeId: string,
+    field: 'actuals' | 'nextPlan',
+    value: string
+  ) => void;
+}
+
+const OpenModeSection: React.FC<OpenModeSectionProps> = ({
+  entries,
+  onUpdateField,
+}) => {
+  const dueLabel = (state: DueState): string =>
+    state === 'overdue'
+      ? 'Overdue'
+      : state === 'duesoon'
+      ? 'Due soon'
+      : 'On time';
+
+  const nextPlanHeader = 'Next Plan (current open periods)';
+
+  if (entries.length === 0) {
+    return (
+      <View style={styles.section}>
+        <Text style={styles.sectionTitle}>Open PPPs</Text>
+        <Text style={styles.cycleMetaSmall}>
+          No open PPP periods match the current filters.
+        </Text>
+      </View>
+    );
+  }
+
+  return (
+    <View style={styles.section}>
+      <Text style={styles.sectionTitle}>Open PPPs</Text>
+      <Text style={styles.cycleMetaSmall}>
+        Showing {entries.length} open PPP period
+        {entries.length === 1 ? '' : 's'}.
+      </Text>
+
+      <PPPHeaderRow nextPlanHeader={nextPlanHeader} />
+
+      {entries.map(({ node, cycle, dueState }) => {
+        const periodText =
+          cycle.startDate || cycle.endDate
+            ? `${cycle.startDate || ''}${
+                cycle.endDate ? ` → ${cycle.endDate}` : ''
+              }`
+            : '';
+
+        const statusLabel = periodText
+          ? `${dueLabel(dueState)} · ${periodText}`
+          : dueLabel(dueState);
+
+        return (
+          <PPPRow
+            key={node.id}
+            node={node}
+            cycle={cycle}
+            editable={cycle.status === 'open'}
+            onUpdateField={(field, value) =>
+              onUpdateField(node.id, field, value)
+            }
+            statusLabel={statusLabel}
+          />
+        );
+      })}
+    </View>
+  );
+};
+
 // ---- Pill components ----
 
 interface PillProps {
@@ -866,7 +1127,7 @@ interface PillProps {
   onPress: () => void;
 }
 
-// Mode pills (Entry / Review / Owners) – pink active
+// Mode pills (Entry / Review / Owners / Open) – pink active
 const ModePill: React.FC<PillProps> = ({ label, active, onPress }) => (
   <Pressable
     onPress={onPress}
@@ -878,7 +1139,7 @@ const ModePill: React.FC<PillProps> = ({ label, active, onPress }) => (
   </Pressable>
 );
 
-// Owner pills (for owner selection)
+// Owner / filter pills
 const OwnerPill: React.FC<PillProps> = ({ label, active, onPress }) => (
   <Pressable
     onPress={onPress}
@@ -942,15 +1203,25 @@ export default function App() {
   const [state, setState] = useState<AppState>(initialState);
 
   const inOwnersMode = state.viewMode === 'owners';
+  const inEntryOrReview =
+    state.viewMode === 'entry' || state.viewMode === 'review';
 
-  // For owners mode, show ALL workstreams/tasks; otherwise, filtered by selection
   const projects = getProjects(state.nodes);
+
+  // Workstreams visibility:
   const workstreams = inOwnersMode
-    ? state.nodes.filter((n) => n.kind === 'workstream')
-    : getWorkstreams(state.nodes, state.activeProjectId);
-  const tasks = inOwnersMode
-    ? state.nodes.filter((n) => n.kind === 'task')
-    : getTasks(state.nodes, state.activeWorkstreamId);
+    ? getAllWorkstreams(state.nodes)
+    : state.activeProjectId
+    ? getWorkstreamsForProject(state.nodes, state.activeProjectId)
+    : getAllWorkstreams(state.nodes);
+
+  // Tasks visibility (for pills)
+  const tasks = getVisibleTasksForEntryReview(
+    state.nodes,
+    state.activeProjectId,
+    state.activeWorkstreamId,
+    inOwnersMode
+  );
 
   const ownerSummaries = getOwnerSummaries(state.nodes);
   const activeOwnerSummary = ownerSummaries.find(
@@ -974,6 +1245,66 @@ export default function App() {
   const currentCycle = getCurrentCycle(currentNode);
   const totalPeriods = currentNode.cycles.length;
   const currentLabelPrefix = getNodeLabelPrefix(currentNode.kind);
+
+  const today = new Date();
+
+  // ---- Open mode data ----
+  const openEntriesAll: OpenEntry[] = state.nodes.flatMap((node) => {
+    const cycle = getCurrentCycle(node);
+    if (cycle.status !== 'open') return [];
+    const targetEnd = getTargetEndDate(node, cycle);
+    const dueState = getDueStateForCycle(node, cycle, today);
+    return [{ node, cycle, dueState, targetEnd }];
+  });
+
+  const openOwners = Array.from(
+    new Set(
+      openEntriesAll
+        .map((e) => (e.cycle.owner || '').trim())
+        .filter((o) => o.length > 0)
+    )
+  ).sort();
+
+  const openEntriesFiltered = openEntriesAll.filter((entry) => {
+    const { node, cycle, dueState } = entry;
+
+    if (state.openOwnerFilter) {
+      const owner = (cycle.owner || '').trim();
+      if (owner !== state.openOwnerFilter) return false;
+    }
+
+    if (state.openKindFilter !== 'all' && node.kind !== state.openKindFilter) {
+      return false;
+    }
+
+    if (
+      state.openCadenceFilter !== 'all' &&
+      node.cadence !== state.openCadenceFilter
+    ) {
+      return false;
+    }
+
+    if (state.openDueFilter !== 'all' && dueState !== state.openDueFilter) {
+      return false;
+    }
+
+    return true;
+  });
+
+  const overdueCount = openEntriesAll.filter(
+    (e) => e.dueState === 'overdue'
+  ).length;
+  const dueSoonCount = openEntriesAll.filter(
+    (e) => e.dueState === 'duesoon'
+  ).length;
+
+  const earliestTargetEnd = (() => {
+    const dates = openEntriesAll
+      .map((e) => e.targetEnd)
+      .filter((d): d is Date => !!d);
+    if (dates.length === 0) return undefined;
+    return dates.reduce((min, d) => (d < min ? d : min), dates[0]);
+  })();
 
   // Generic "update node field for current open period"
   const handleUpdateNodeField = (
@@ -1069,7 +1400,6 @@ export default function App() {
             ownerVisibleNodeIds: [],
           };
         }
-        // If existing activeOwner is still valid, keep it; otherwise pick first
         const existing = summaries.find((s) => s.owner === prev.activeOwner);
         const chosen = existing ?? summaries[0];
         const visibleIds = chosen.entries.map((e) => e.node.id);
@@ -1122,6 +1452,60 @@ export default function App() {
     });
   };
 
+  // Open mode filter handlers
+  const handleSetOpenOwnerFilter = (owner?: string) => {
+    setState((prev) => ({
+      ...prev,
+      openOwnerFilter: owner,
+    }));
+  };
+
+  const handleSetOpenKindFilter = (kind: 'all' | CadenceKind) => {
+    setState((prev) => ({
+      ...prev,
+      openKindFilter: kind,
+    }));
+  };
+
+  const handleSetOpenCadenceFilter = (cadence: 'all' | CadenceType) => {
+    setState((prev) => ({
+      ...prev,
+      openCadenceFilter: cadence,
+    }));
+  };
+
+  const handleSetOpenDueFilter = (due: 'all' | DueState) => {
+    setState((prev) => ({
+      ...prev,
+      openDueFilter: due,
+    }));
+  };
+
+  // ALL pills actions (Entry/Review)
+  const clearProjectSelection = () => {
+    setState((prev) => ({
+      ...prev,
+      activeProjectId: undefined,
+      activeWorkstreamId: undefined,
+      activeTaskId: undefined,
+    }));
+  };
+
+  const clearWorkstreamSelection = () => {
+    setState((prev) => ({
+      ...prev,
+      activeWorkstreamId: undefined,
+      activeTaskId: undefined,
+    }));
+  };
+
+  const clearTaskSelection = () => {
+    setState((prev) => ({
+      ...prev,
+      activeTaskId: undefined,
+    }));
+  };
+
   return (
     <SafeAreaView style={styles.safeArea}>
       <ScrollView contentContainerStyle={styles.scrollContent}>
@@ -1145,7 +1529,32 @@ export default function App() {
             active={state.viewMode === 'owners'}
             onPress={() => handleSetViewMode('owners')}
           />
+          <ModePill
+            label="Open"
+            active={state.viewMode === 'open'}
+            onPress={() => handleSetViewMode('open')}
+          />
         </View>
+
+        {/* Open-mode mini summary bar */}
+        {state.viewMode !== 'open' && (
+          <View style={styles.openSummaryBar}>
+            <Text style={styles.openSummaryText}>
+              Open PPP periods: {openEntriesAll.length} (Overdue:{' '}
+              {overdueCount}, Due soon: {dueSoonCount})
+            </Text>
+            {earliestTargetEnd ? (
+              <Text style={styles.openSummaryHint}>
+                Next checkpoint: {formatISODate(earliestTargetEnd)}. Switch to
+                "Open" mode to review & close.
+              </Text>
+            ) : (
+              <Text style={styles.openSummaryHint}>
+                No upcoming checkpoints. All PPP periods are closed.
+              </Text>
+            )}
+          </View>
+        )}
 
         {/* Owner pills (only in Owners mode) */}
         {state.viewMode === 'owners' && (
@@ -1170,9 +1579,126 @@ export default function App() {
           </>
         )}
 
+        {/* Open-mode filters */}
+        {state.viewMode === 'open' && (
+          <View style={styles.section}>
+            <Text style={styles.sectionTitle}>Open PPP Filters</Text>
+
+            {/* Owner filter */}
+            <Text style={styles.selectorLabel}>Owner</Text>
+            <View style={styles.ownerPillRow}>
+              <OwnerPill
+                label="All"
+                active={!state.openOwnerFilter}
+                onPress={() => handleSetOpenOwnerFilter(undefined)}
+              />
+              {openOwners.map((owner) => (
+                <OwnerPill
+                  key={owner}
+                  label={owner}
+                  active={state.openOwnerFilter === owner}
+                  onPress={() => handleSetOpenOwnerFilter(owner)}
+                />
+              ))}
+            </View>
+
+            {/* Level filter */}
+            <Text style={styles.selectorLabel}>Level</Text>
+            <View style={styles.ownerPillRow}>
+              <OwnerPill
+                label="All"
+                active={state.openKindFilter === 'all'}
+                onPress={() => handleSetOpenKindFilter('all')}
+              />
+              <OwnerPill
+                label="Projects"
+                active={state.openKindFilter === 'project'}
+                onPress={() => handleSetOpenKindFilter('project')}
+              />
+              <OwnerPill
+                label="Workstreams"
+                active={state.openKindFilter === 'workstream'}
+                onPress={() => handleSetOpenKindFilter('workstream')}
+              />
+              <OwnerPill
+                label="Tasks"
+                active={state.openKindFilter === 'task'}
+                onPress={() => handleSetOpenKindFilter('task')}
+              />
+            </View>
+
+            {/* Cadence filter */}
+            <Text style={styles.selectorLabel}>Cadence</Text>
+            <View style={styles.ownerPillRow}>
+              <OwnerPill
+                label="All"
+                active={state.openCadenceFilter === 'all'}
+                onPress={() => handleSetOpenCadenceFilter('all')}
+              />
+              <OwnerPill
+                label="Daily"
+                active={state.openCadenceFilter === 'daily'}
+                onPress={() => handleSetOpenCadenceFilter('daily')}
+              />
+              <OwnerPill
+                label="Weekly"
+                active={state.openCadenceFilter === 'weekly'}
+                onPress={() => handleSetOpenCadenceFilter('weekly')}
+              />
+              <OwnerPill
+                label="Biweekly"
+                active={state.openCadenceFilter === 'biweekly'}
+                onPress={() => handleSetOpenCadenceFilter('biweekly')}
+              />
+              <OwnerPill
+                label="Monthly"
+                active={state.openCadenceFilter === 'monthly'}
+                onPress={() => handleSetOpenCadenceFilter('monthly')}
+              />
+              <OwnerPill
+                label="Quarterly"
+                active={state.openCadenceFilter === 'quarterly'}
+                onPress={() => handleSetOpenCadenceFilter('quarterly')}
+              />
+            </View>
+
+            {/* Due status filter */}
+            <Text style={styles.selectorLabel}>Status</Text>
+            <View style={styles.ownerPillRow}>
+              <OwnerPill
+                label="All"
+                active={state.openDueFilter === 'all'}
+                onPress={() => handleSetOpenDueFilter('all')}
+              />
+              <OwnerPill
+                label="On time"
+                active={state.openDueFilter === 'ontime'}
+                onPress={() => handleSetOpenDueFilter('ontime')}
+              />
+              <OwnerPill
+                label="Due soon"
+                active={state.openDueFilter === 'duesoon'}
+                onPress={() => handleSetOpenDueFilter('duesoon')}
+              />
+              <OwnerPill
+                label="Overdue"
+                active={state.openDueFilter === 'overdue'}
+                onPress={() => handleSetOpenDueFilter('overdue')}
+              />
+            </View>
+          </View>
+        )}
+
         {/* Project pills */}
         <Text style={styles.selectorLabel}>Projects</Text>
         <View style={styles.pillRow}>
+          {inEntryOrReview && (
+            <SelectorPill
+              label="ALL"
+              active={!state.activeProjectId}
+              onPress={clearProjectSelection}
+            />
+          )}
           {projects.map((p) => {
             const highlighted =
               state.viewMode === 'owners' &&
@@ -1206,6 +1732,13 @@ export default function App() {
         {/* Workstream pills */}
         <Text style={styles.selectorLabel}>Workstreams</Text>
         <View style={styles.pillRow}>
+          {inEntryOrReview && (
+            <SelectorPill
+              label="ALL"
+              active={!state.activeWorkstreamId}
+              onPress={clearWorkstreamSelection}
+            />
+          )}
           {workstreams.length === 0 ? (
             <Text style={styles.cycleMetaSmall}>
               No workstreams yet.
@@ -1245,6 +1778,13 @@ export default function App() {
         {/* Task pills */}
         <Text style={styles.selectorLabel}>Tasks</Text>
         <View style={styles.pillRow}>
+          {inEntryOrReview && (
+            <SelectorPill
+              label="ALL"
+              active={!state.activeTaskId}
+              onPress={clearTaskSelection}
+            />
+          )}
           {tasks.length === 0 ? (
             <Text style={styles.cycleMetaSmall}>
               No tasks yet.
@@ -1282,7 +1822,7 @@ export default function App() {
         </View>
 
         {/* Active node info (Entry / Review only) */}
-        {state.viewMode !== 'owners' && (
+        {(state.viewMode === 'entry' || state.viewMode === 'review') && (
           <>
             <Text style={styles.nodeTitle}>
               {currentLabelPrefix}: {currentNode.name}
@@ -1317,10 +1857,15 @@ export default function App() {
             currentNode={currentNode}
             onUpdateField={handleUpdateNodeField}
           />
-        ) : (
+        ) : state.viewMode === 'owners' ? (
           <OwnersOverviewSection
             summary={activeOwnerSummary}
             visibleNodeIds={state.ownerVisibleNodeIds}
+            onUpdateField={handleUpdateNodeField}
+          />
+        ) : (
+          <OpenModeSection
+            entries={openEntriesFiltered}
             onUpdateField={handleUpdateNodeField}
           />
         )}
@@ -1490,7 +2035,7 @@ const styles = StyleSheet.create({
     color: '#880e4f',
     fontWeight: '600',
   },
-  // Owner pills
+  // Owner/filter pills
   ownerPillRow: {
     flexDirection: 'row',
     flexWrap: 'wrap',
@@ -1595,5 +2140,22 @@ const styles = StyleSheet.create({
     fontSize: 13,
     textAlignVertical: 'top',
     minHeight: 40,
+  },
+  // Open summary bar
+  openSummaryBar: {
+    paddingVertical: 6,
+    paddingHorizontal: 8,
+    borderRadius: 8,
+    backgroundColor: '#e8f5e9',
+    marginBottom: 4,
+  },
+  openSummaryText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#1b5e20',
+  },
+  openSummaryHint: {
+    fontSize: 11,
+    color: '#4caf50',
   },
 });
