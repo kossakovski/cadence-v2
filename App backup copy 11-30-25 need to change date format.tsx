@@ -210,47 +210,6 @@ function addDays(date: Date, days: number): Date {
   return d;
 }
 
-// Human-readable date formatting: "March 1" or "March 1 – March 7" (no year)
-function formatHumanDate(dateStr?: string): string | undefined {
-  if (!dateStr) return undefined;
-  try {
-    const d = parseISODate(dateStr);
-    if (Number.isNaN(d.getTime())) return dateStr;
-    const monthNames = [
-      'January',
-      'February',
-      'March',
-      'April',
-      'May',
-      'June',
-      'July',
-      'August',
-      'September',
-      'October',
-      'November',
-      'December',
-    ];
-    const month = monthNames[d.getMonth()];
-    const day = d.getDate();
-    return `${month} ${day}`;
-  } catch {
-    return dateStr;
-  }
-}
-
-function formatHumanDateRange(
-  startStr?: string,
-  endStr?: string
-): string | undefined {
-  if (!startStr && !endStr) return undefined;
-  const startLabel = formatHumanDate(startStr);
-  const endLabel = formatHumanDate(endStr);
-  if (startLabel && endLabel) {
-    return `${startLabel} – ${endLabel}`;
-  }
-  return startLabel || endLabel || undefined;
-}
-
 function getNextPeriodRange(
   node: CadenceNode,
   cycle: CadenceCycle
@@ -533,7 +492,7 @@ interface PPPRowProps {
   cycle: CadenceCycle;
   editable: boolean;
   onUpdateField?: (field: 'actuals' | 'nextPlan', value: string) => void;
-  statusLabel?: string; // e.g., "Overdue · March 1 – March 7"
+  statusLabel?: string; // e.g., "Overdue · 2025-01-01 → 2025-01-07"
   // Owner editing
   ownerEditable?: boolean;
   onUpdateOwner?: (value: string) => void;
@@ -565,7 +524,9 @@ const PPPRow: React.FC<PPPRowProps> = ({
     ownerEditable && cycle.status === 'open' && !!onUpdateOwner;
 
   const periodText =
-    formatHumanDateRange(cycle.startDate, cycle.endDate) || '';
+    cycle.startDate || cycle.endDate
+      ? `${cycle.startDate || ''}${cycle.endDate ? ` → ${cycle.endDate}` : ''}`
+      : '';
 
   const effectiveStatusLine = (() => {
     const owner = (cycle.owner || '').trim();
@@ -846,7 +807,10 @@ const ReviewSection: React.FC<ReviewSectionProps> = ({
       actualEnd = formatISODate(targetEnd);
     }
   }
-  const actualRangeLabel = formatHumanDateRange(actualStart, actualEnd);
+  const actualRangeLabel =
+    actualStart || actualEnd
+      ? `${actualStart || ''}${actualEnd ? ` → ${actualEnd}` : ''}`
+      : undefined;
 
   // Previous Plan = previous cycle, if any
   let previousRangeLabel: string | undefined;
@@ -860,13 +824,16 @@ const ReviewSection: React.FC<ReviewSectionProps> = ({
         prevEnd = formatISODate(prevTargetEnd);
       }
     }
-    previousRangeLabel = formatHumanDateRange(prevStart, prevEnd);
+    if (prevStart || prevEnd) {
+      previousRangeLabel = `${prevStart || ''}${
+        prevEnd ? ` → ${prevEnd}` : ''
+      }`;
+    }
   }
 
   // Next Plan = next period range
-  const nextRangeLabel = nextRange
-    ? formatHumanDateRange(nextRange.start, nextRange.end)
-    : undefined;
+  const nextRangeLabel =
+    nextRange ? `${nextRange.start} → ${nextRange.end}` : undefined;
 
   // Simple label text for the top line
   const nextPlanHeader = 'Next Plan';
@@ -1182,7 +1149,11 @@ const OpenModeSection: React.FC<OpenModeSectionProps> = ({
 
       {entries.map(({ node, cycle, dueState }) => {
         const periodText =
-          formatHumanDateRange(cycle.startDate, cycle.endDate) || '';
+          cycle.startDate || cycle.endDate
+            ? `${cycle.startDate || ''}${
+                cycle.endDate ? ` → ${cycle.endDate}` : ''
+              }`
+            : '';
 
         const statusLabel = periodText
           ? `${dueLabel(dueState)} · ${periodText}`
@@ -1456,10 +1427,6 @@ export default function App() {
     if (dates.length === 0) return undefined;
     return dates.reduce((min, d) => (d < min ? d : min), dates[0]);
   })();
-
-  const earliestTargetEndLabel = earliestTargetEnd
-    ? formatHumanDate(formatISODate(earliestTargetEnd))
-    : undefined;
 
   // ---- Handlers ----
 
@@ -2073,9 +2040,9 @@ export default function App() {
               Open periods: {openEntriesAll.length} (Overdue:{' '}
               {overdueCount}, Due soon: {dueSoonCount})
             </Text>
-            {earliestTargetEndLabel ? (
+            {earliestTargetEnd ? (
               <Text style={styles.openSummaryHint}>
-                Next checkpoint: {earliestTargetEndLabel}. Switch to
+                Next checkpoint: {formatISODate(earliestTargetEnd)}. Switch to
                 Advanced → "Open" mode to review & complete.
               </Text>
             ) : (

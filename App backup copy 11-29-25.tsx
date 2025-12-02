@@ -35,7 +35,7 @@ interface CadenceNode {
   parentId?: string; // undefined for top-level projects
   name: string;
   cadence: CadenceType;
-  cycles: CadenceCycle[]; // for MVP, cadence table is meaningful only for tasks
+  cycles: CadenceCycle[]; // for MVP, PPP is meaningful only for tasks
   retired?: boolean;
 
   // Workstream milestone support (for kind === 'workstream')
@@ -69,10 +69,194 @@ interface AppState {
 // ---- Initial sample state ----
 
 const initialState: AppState = {
-  nodes: [],
-  activeProjectId: undefined,
-  activeWorkstreamId: undefined,
-  activeTaskId: undefined,
+  nodes: [
+    // Project
+    {
+      id: 'proj-1',
+      kind: 'project',
+      name: 'Cadence App v2',
+      cadence: 'weekly',
+      cycles: [
+        {
+          id: 'proj-1-period-1',
+          index: 0,
+          status: 'closed',
+          startDate: '2025-01-01',
+          endDate: '2025-01-07',
+          previousPlan:
+            'Kick off project; decide on stack and basic PPP concept.',
+          actuals: 'Chose React Native + Expo, drafted PPP model idea.',
+          nextPlan: 'Define universal cadence object and nesting.',
+          owner: 'Dmitri',
+          reviewed: true,
+        },
+        {
+          id: 'proj-1-period-2',
+          index: 1,
+          status: 'open',
+          startDate: '2025-01-08',
+          previousPlan: 'Define universal cadence object and nesting.',
+          actuals: '',
+          nextPlan: 'Implement v2 prototype with hierarchical UI.',
+          owner: 'Dmitri',
+          reviewed: false,
+        },
+      ],
+    },
+
+    // Workstreams under proj-1
+    {
+      id: 'ws-1',
+      kind: 'workstream',
+      parentId: 'proj-1',
+      name: 'Architecture & Model',
+      cadence: 'monthly',
+      cycles: [
+        {
+          id: 'ws-1-period-1',
+          index: 0,
+          status: 'open',
+          startDate: '2025-01-10',
+          previousPlan: 'Describe universal cadence object (PPP, periods).',
+          actuals: '',
+          nextPlan: 'Add parent/child nesting Project → Workstream → Task.',
+          owner: 'Dmitri',
+          reviewed: false,
+        },
+      ],
+      milestone: 'Define MVP data model',
+      milestoneDate: '2025-02-01',
+    },
+    {
+      id: 'ws-2',
+      kind: 'workstream',
+      parentId: 'proj-1',
+      name: 'Implementation',
+      cadence: 'weekly',
+      cycles: [
+        {
+          id: 'ws-2-period-1',
+          index: 0,
+          status: 'open',
+          startDate: '2025-01-12',
+          previousPlan: 'Build basic PPP UI in React Native.',
+          actuals: '',
+          nextPlan: 'Refine layout, add selectors.',
+          owner: 'Dmitri',
+          reviewed: false,
+        },
+      ],
+      milestone: 'Ship MVP to TestFlight',
+      milestoneDate: '2025-03-01',
+    },
+
+    // Tasks under ws-1
+    {
+      id: 'task-1',
+      kind: 'task',
+      parentId: 'ws-1',
+      name: 'Define universal cadence object',
+      cadence: 'weekly',
+      cycles: [
+        {
+          id: 'task-1-period-1',
+          index: 0,
+          status: 'open',
+          startDate: '2025-01-15',
+          previousPlan: 'Capture fields for PPP and periods.',
+          actuals: '',
+          nextPlan: 'Validate model across project/workstream/task.',
+          owner: 'Dmitri',
+          reviewed: false,
+        },
+      ],
+    },
+    {
+      id: 'task-2',
+      kind: 'task',
+      parentId: 'ws-1',
+      name: 'Define nesting rules',
+      cadence: 'weekly',
+      cycles: [
+        {
+          id: 'task-2-period-1',
+          index: 0,
+          status: 'open',
+          startDate: '2025-01-16',
+          previousPlan: 'Decide how nodes reference parents and children.',
+          actuals: '',
+          nextPlan: 'Implement UI that reflects hierarchy with pills.',
+          owner: 'Dmitri',
+          reviewed: false,
+        },
+      ],
+    },
+
+    // Tasks under ws-2
+    {
+      id: 'task-3',
+      kind: 'task',
+      parentId: 'ws-2',
+      name: 'Implement React Native prototype',
+      cadence: 'weekly',
+      cycles: [
+        {
+          id: 'task-3-period-1',
+          index: 0,
+          status: 'open',
+          startDate: '2025-01-18',
+          previousPlan: 'Get PPP UI running on web + iPhone.',
+          actuals: '',
+          nextPlan: 'Plug in universal model + hierarchy.',
+          owner: 'Dmitri',
+          reviewed: false,
+        },
+      ],
+    },
+    {
+      id: 'task-4',
+      kind: 'task',
+      parentId: 'ws-2',
+      name: 'Implement iPhone layout',
+      cadence: 'weekly',
+      cycles: [
+        {
+          id: 'task-4-period-1',
+          index: 0,
+          status: 'open',
+          startDate: '2025-01-19',
+          previousPlan: 'Design single-task-per-screen navigation.',
+          actuals: '',
+          nextPlan: 'Prototype horizontal swipe across periods.',
+          owner: 'Alex',
+          reviewed: false,
+        },
+      ],
+    },
+    {
+      id: 'task-5',
+      kind: 'task',
+      parentId: 'ws-2',
+      name: 'Define testing strategy',
+      cadence: 'weekly',
+      cycles: [
+        {
+          id: 'task-5-period-1',
+          index: 0,
+          status: 'open',
+          startDate: '2025-01-20',
+          previousPlan: 'Outline unit + integration tests.',
+          actuals: '',
+          nextPlan: 'Implement first test suite for PPP logic.',
+          owner: 'Jordan',
+          reviewed: false,
+        },
+      ],
+    },
+  ],
+  activeProjectId: 'proj-1',
+  activeWorkstreamId: 'ws-1',
+  activeTaskId: 'task-1',
   viewMode: 'review',
   activeOwner: undefined,
   ownerVisibleNodeIds: [],
@@ -147,7 +331,7 @@ function getChildren(nodes: CadenceNode[], parentId: string): CadenceNode[] {
   return nodes.filter((n) => n.parentId === parentId && !n.retired);
 }
 
-// Determine which node's cadence table we are currently viewing for context:
+// Determine which node's PPP we are currently viewing for context:
 function getCurrentNode(state: AppState): CadenceNode | undefined {
   const { nodes, activeTaskId, activeWorkstreamId, activeProjectId } = state;
 
@@ -208,47 +392,6 @@ function addDays(date: Date, days: number): Date {
   const d = new Date(date.getTime());
   d.setDate(d.getDate() + days);
   return d;
-}
-
-// Human-readable date formatting: "March 1" or "March 1 – March 7" (no year)
-function formatHumanDate(dateStr?: string): string | undefined {
-  if (!dateStr) return undefined;
-  try {
-    const d = parseISODate(dateStr);
-    if (Number.isNaN(d.getTime())) return dateStr;
-    const monthNames = [
-      'January',
-      'February',
-      'March',
-      'April',
-      'May',
-      'June',
-      'July',
-      'August',
-      'September',
-      'October',
-      'November',
-      'December',
-    ];
-    const month = monthNames[d.getMonth()];
-    const day = d.getDate();
-    return `${month} ${day}`;
-  } catch {
-    return dateStr;
-  }
-}
-
-function formatHumanDateRange(
-  startStr?: string,
-  endStr?: string
-): string | undefined {
-  if (!startStr && !endStr) return undefined;
-  const startLabel = formatHumanDate(startStr);
-  const endLabel = formatHumanDate(endStr);
-  if (startLabel && endLabel) {
-    return `${startLabel} – ${endLabel}`;
-  }
-  return startLabel || endLabel || undefined;
 }
 
 function getNextPeriodRange(
@@ -360,7 +503,7 @@ function closeCurrentCycle(node: CadenceNode): CadenceNode {
   };
 }
 
-// ---- Cadence helpers ----
+// ---- PPP helpers ----
 
 function getCadenceLabel(cadence: CadenceType): string {
   switch (cadence) {
@@ -389,11 +532,7 @@ function getNodeLabelPrefix(kind: CadenceKind): string {
 
 function nodeOwnedBy(node: CadenceNode, owner: string | undefined): boolean {
   if (!owner) return false;
-  if (!node.cycles || node.cycles.length === 0) return false;
-
   const cycle = getCurrentCycle(node);
-  if (!cycle) return false;
-
   return (cycle.owner || '').trim() === owner.trim();
 }
 
@@ -475,49 +614,30 @@ function getOwnerSummaries(nodes: CadenceNode[]): OwnerSummary[] {
   return summaries;
 }
 
-// ---- Cadence header ----
+// ---- PPP header ----
 
 interface PPPHeaderProps {
   nextPlanHeader: string;
   showActions?: boolean;
-  previousDateLabel?: string;
-  actualDateLabel?: string;
-  nextDateLabel?: string;
 }
 
 const PPPHeaderRow: React.FC<PPPHeaderProps> = ({
   nextPlanHeader,
   showActions,
-  previousDateLabel,
-  actualDateLabel,
-  nextDateLabel,
 }) => (
   <View style={styles.pppHeaderRow}>
     <View style={[styles.pppHeaderCell, styles.pppObjectHeaderCell]}>
       <Text style={styles.pppHeaderText}>Object</Text>
     </View>
-
     <View style={styles.pppHeaderCell}>
       <Text style={styles.pppHeaderText}>Previous Plan</Text>
-      {previousDateLabel ? (
-        <Text style={styles.pppHeaderSubText}>{previousDateLabel}</Text>
-      ) : null}
     </View>
-
     <View style={styles.pppHeaderCell}>
       <Text style={styles.pppHeaderText}>Actuals</Text>
-      {actualDateLabel ? (
-        <Text style={styles.pppHeaderSubText}>{actualDateLabel}</Text>
-      ) : null}
     </View>
-
     <View style={styles.pppHeaderCell}>
       <Text style={styles.pppHeaderText}>{nextPlanHeader}</Text>
-      {nextDateLabel ? (
-        <Text style={styles.pppHeaderSubText}>{nextDateLabel}</Text>
-      ) : null}
     </View>
-
     {showActions && (
       <View style={[styles.pppHeaderCell, styles.pppActionsHeaderCell]}>
         <Text style={styles.pppHeaderText}>Actions</Text>
@@ -526,14 +646,14 @@ const PPPHeaderRow: React.FC<PPPHeaderProps> = ({
   </View>
 );
 
-// ---- Cadence row (read-only or editable for current open period) ----
+// ---- PPP row (read-only or editable for current open period) ----
 
 interface PPPRowProps {
   node: CadenceNode;
   cycle: CadenceCycle;
   editable: boolean;
   onUpdateField?: (field: 'actuals' | 'nextPlan', value: string) => void;
-  statusLabel?: string; // e.g., "Overdue · March 1 – March 7"
+  statusLabel?: string; // e.g., "Overdue · 2025-01-01 → 2025-01-07"
   // Owner editing
   ownerEditable?: boolean;
   onUpdateOwner?: (value: string) => void;
@@ -565,7 +685,9 @@ const PPPRow: React.FC<PPPRowProps> = ({
     ownerEditable && cycle.status === 'open' && !!onUpdateOwner;
 
   const periodText =
-    formatHumanDateRange(cycle.startDate, cycle.endDate) || '';
+    cycle.startDate || cycle.endDate
+      ? `${cycle.startDate || ''}${cycle.endDate ? ` → ${cycle.endDate}` : ''}`
+      : '';
 
   const effectiveStatusLine = (() => {
     const owner = (cycle.owner || '').trim();
@@ -744,10 +866,10 @@ const ReviewSection: React.FC<ReviewSectionProps> = ({
 
   // Determine scope based on active selections
   const project =
-    activeProjectId &&
-    nodes.find(
-      (n) => n.id === activeProjectId && n.kind === 'project' && !n.retired
-    );
+    (activeProjectId &&
+      nodes.find(
+        (n) => n.id === activeProjectId && n.kind === 'project' && !n.retired
+      )) || projects[0];
 
   const workstream =
     activeWorkstreamId &&
@@ -768,44 +890,27 @@ const ReviewSection: React.FC<ReviewSectionProps> = ({
   const rows: RowNode[] = [];
 
   let scopeLabel = '';
-  let scopeOwnerLabel: string | undefined = undefined;
 
   if (task) {
     // Most specific: show just this Task
     rows.push(task);
     scopeLabel = `Task: ${task.name}`;
   } else if (workstream) {
-    // All tasks under the selected workstream
+    // Workstream + ALL tasks under it
+    rows.push(workstream);
     const tasksUnderWS = getTasksForWorkstream(nodes, workstream.id);
     rows.push(...tasksUnderWS);
     scopeLabel = `Workstream: ${workstream.name}`;
-
-    // Derive owner(s) from tasks under this workstream
-    const ownerSet = new Set<string>();
-    tasksUnderWS.forEach((t) => {
-      if (!t.cycles || t.cycles.length === 0) return;
-      const c = getCurrentCycle(t);
-      const o = (c.owner || '').trim();
-      if (o) ownerSet.add(o);
-    });
-
-    if (ownerSet.size > 0) {
-      const owners = Array.from(ownerSet).sort();
-      scopeOwnerLabel =
-        owners.length === 1
-          ? `Owner: ${owners[0]}`
-          : `Owners: ${owners.join(', ')}`;
-    }
   } else if (project) {
-    // All tasks under the selected project
+    // Project + ALL workstreams + ALL tasks under those workstreams
+    rows.push(project);
+    const wsUnderProj = getWorkstreamsForProject(nodes, project.id);
+    rows.push(...wsUnderProj);
+
     const tasksUnderProj = getTasksForProject(nodes, project.id);
     rows.push(...tasksUnderProj);
+
     scopeLabel = `Project: ${project.name}`;
-  } else {
-    // No specific scope → all tasks in the system
-    const allTasks = getTasksForProject(nodes, undefined);
-    rows.push(...allTasks);
-    scopeLabel = 'All tasks';
   }
 
   if (rows.length === 0) {
@@ -833,43 +938,13 @@ const ReviewSection: React.FC<ReviewSectionProps> = ({
   const visiblePrimaryCycle =
     primarySortedCycles[Math.max(0, visibleIdx)] || primarySortedCycles[0];
 
-  // Header date ranges for Previous / Actuals / Next
+  // Header for "Next Plan" based on visible period
   const cadenceLabel = getCadenceLabel(primaryNode.cadence);
   const nextRange = getNextPeriodRange(primaryNode, visiblePrimaryCycle);
 
-  // Actuals = visible period
-  const actualStart = visiblePrimaryCycle.startDate;
-  let actualEnd = visiblePrimaryCycle.endDate;
-  if (!actualEnd) {
-    const targetEnd = getTargetEndDate(primaryNode, visiblePrimaryCycle);
-    if (targetEnd) {
-      actualEnd = formatISODate(targetEnd);
-    }
-  }
-  const actualRangeLabel = formatHumanDateRange(actualStart, actualEnd);
-
-  // Previous Plan = previous cycle, if any
-  let previousRangeLabel: string | undefined;
-  if (visibleIdx > 0 && totalCycles > 1) {
-    const prevCycle = primarySortedCycles[visibleIdx - 1];
-    const prevStart = prevCycle.startDate;
-    let prevEnd = prevCycle.endDate;
-    if (!prevEnd) {
-      const prevTargetEnd = getTargetEndDate(primaryNode, prevCycle);
-      if (prevTargetEnd) {
-        prevEnd = formatISODate(prevTargetEnd);
-      }
-    }
-    previousRangeLabel = formatHumanDateRange(prevStart, prevEnd);
-  }
-
-  // Next Plan = next period range
-  const nextRangeLabel = nextRange
-    ? formatHumanDateRange(nextRange.start, nextRange.end)
-    : undefined;
-
-  // Simple label text for the top line
-  const nextPlanHeader = 'Next Plan';
+  const nextPlanHeader = nextRange
+    ? `Next Plan (next ${cadenceLabel}: ${nextRange.start} → ${nextRange.end})`
+    : `Next Plan (for the next ${cadenceLabel})`;
 
   const canGoPrev = clampedOffset < totalCycles - 1;
   const canGoNext = clampedOffset > 0;
@@ -926,13 +1001,12 @@ const ReviewSection: React.FC<ReviewSectionProps> = ({
       <Text style={styles.cycleMetaSmall}>
         Scope: {scopeLabel || 'All'}
       </Text>
-      {scopeOwnerLabel && (
-        <Text style={styles.cycleMetaSmall}>{scopeOwnerLabel}</Text>
-      )}
 
       {/* Period navigation row */}
       <View style={styles.cycleNavRow}>
-        {/* No more "Cycle N of N" – only navigation buttons */}
+        <Text style={styles.cycleNavText}>
+          Period: Cycle {visibleIdx + 1} of {totalCycles}
+        </Text>
         <View style={styles.cycleNavButtons}>
           <Pressable
             onPress={handlePrev}
@@ -979,13 +1053,7 @@ const ReviewSection: React.FC<ReviewSectionProps> = ({
         </View>
       </View>
 
-      <PPPHeaderRow
-        nextPlanHeader={nextPlanHeader}
-        previousDateLabel={previousRangeLabel}
-        actualDateLabel={actualRangeLabel}
-        nextDateLabel={nextRangeLabel}
-        showActions
-      />
+      <PPPHeaderRow nextPlanHeader={nextPlanHeader} showActions />
 
       {rows.map((node) => {
         const cycle = getVisibleCycleForNode(node, reviewCycleOffset);
@@ -1081,7 +1149,7 @@ const OwnersOverviewSection: React.FC<OwnersOverviewSectionProps> = ({
       <View style={styles.section}>
         <Text style={styles.sectionTitle}>Owner Overview</Text>
         <Text style={styles.cycleMetaSmall}>
-          Select an owner to see their cadence items.
+          Select an owner to see their PPP.
         </Text>
       </View>
     );
@@ -1099,7 +1167,7 @@ const OwnersOverviewSection: React.FC<OwnersOverviewSectionProps> = ({
 
       {visibleEntries.length === 0 ? (
         <Text style={styles.cycleMetaSmall}>
-          No items selected for this owner. Use the gold-highlighted
+          No PPP entries selected for this owner. Use the gold-highlighted
           project/workstream/task pills to toggle visibility.
         </Text>
       ) : (
@@ -1122,7 +1190,7 @@ const OwnersOverviewSection: React.FC<OwnersOverviewSectionProps> = ({
   );
 };
 
-// ---- Open mode section (All open periods) ----
+// ---- Open mode section (All open PPPs) ----
 
 interface OpenEntry {
   node: CadenceNode;
@@ -1162,9 +1230,9 @@ const OpenModeSection: React.FC<OpenModeSectionProps> = ({
   if (entries.length === 0) {
     return (
       <View style={styles.section}>
-        <Text style={styles.sectionTitle}>Open Periods</Text>
+        <Text style={styles.sectionTitle}>Open PPPs</Text>
         <Text style={styles.cycleMetaSmall}>
-          No open periods match the current filters.
+          No open PPP periods match the current filters.
         </Text>
       </View>
     );
@@ -1172,9 +1240,9 @@ const OpenModeSection: React.FC<OpenModeSectionProps> = ({
 
   return (
     <View style={styles.section}>
-      <Text style={styles.sectionTitle}>Open Periods</Text>
+      <Text style={styles.sectionTitle}>Open PPPs</Text>
       <Text style={styles.cycleMetaSmall}>
-        Showing {entries.length} open period
+        Showing {entries.length} open PPP period
         {entries.length === 1 ? '' : 's'}.
       </Text>
 
@@ -1182,7 +1250,11 @@ const OpenModeSection: React.FC<OpenModeSectionProps> = ({
 
       {entries.map(({ node, cycle, dueState }) => {
         const periodText =
-          formatHumanDateRange(cycle.startDate, cycle.endDate) || '';
+          cycle.startDate || cycle.endDate
+            ? `${cycle.startDate || ''}${
+                cycle.endDate ? ` → ${cycle.endDate}` : ''
+              }`
+            : '';
 
         const statusLabel = periodText
           ? `${dueLabel(dueState)} · ${periodText}`
@@ -1300,16 +1372,17 @@ const STORAGE_KEY = 'cadence-app-state-v1';
 
 export default function App() {
   const [state, setState] = useState<AppState>(initialState);
-  const [isHydrated, setIsHydrated] = useState(false);
+
+  
 
   // global cycle offset for Review view (0 = latest)
   const [reviewCycleOffset, setReviewCycleOffset] = useState(0);
 
-  // Help overlay toggle
-  const [showHelp, setShowHelp] = useState(false);
-
   // Advanced toggle
   const [showAdvanced, setShowAdvanced] = useState(false);
+ 
+  // Help panel toggle
+  const [showHelp, setShowHelp] = useState(false);
 
   // Create-new local UI state
   const [isCreatingProject, setIsCreatingProject] = useState(false);
@@ -1325,37 +1398,22 @@ export default function App() {
     useState<CadenceType>('weekly');
 
   // Load persisted state on mount
-  useEffect(() => {
-    const loadState = async () => {
-      try {
-        const stored = await AsyncStorage.getItem(STORAGE_KEY);
-        if (stored) {
-          const parsed: AppState = JSON.parse(stored);
-          setState(parsed);
-        }
-      } catch (err) {
-        console.error('Failed to load Cadence state:', err);
-      } finally {
-        setIsHydrated(true);
-      }
-    };
-
-    loadState();
-  }, []);
+  
 
   // Persist state whenever it changes (after hydration)
-  useEffect(() => {
-    if (!isHydrated) return; // prevent overwriting before load finishes
+ useEffect(() => {
+  const saveState = async () => {
+    try {
+      await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    } catch (err) {
+      console.error('Failed to save Cadence state:', err);
+    }
+  };
+  saveState();
+}, [state]);
 
-    const saveState = async () => {
-      try {
-        await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-      } catch (err) {
-        console.error('Failed to save Cadence state:', err);
-      }
-    };
-    saveState();
-  }, [state, isHydrated]);
+  // Initial loading screen
+  
 
   const inOwnersMode = state.viewMode === 'owners';
   const inReviewMode = state.viewMode === 'review';
@@ -1383,13 +1441,15 @@ export default function App() {
     (s) => s.owner === state.activeOwner
   );
 
-  // Show a tiny loading state while hydrating from AsyncStorage
-  if (!isHydrated) {
+  const currentNode = getCurrentNode(state);
+  if (!currentNode) {
     return (
       <SafeAreaView style={styles.safeArea}>
         <View style={[styles.scrollContent, { justifyContent: 'center' }]}>
           <Text style={styles.appTitle}>Cadence v2 Prototype</Text>
-          <Text style={styles.nodeSubtitle}>Loading your cadence…</Text>
+          <Text style={styles.nodeSubtitle}>
+            No nodes defined. This should not happen with initialState.
+          </Text>
         </View>
       </SafeAreaView>
     );
@@ -1456,10 +1516,6 @@ export default function App() {
     if (dates.length === 0) return undefined;
     return dates.reduce((min, d) => (d < min ? d : min), dates[0]);
   })();
-
-  const earliestTargetEndLabel = earliestTargetEnd
-    ? formatHumanDate(formatISODate(earliestTargetEnd))
-    : undefined;
 
   // ---- Handlers ----
 
@@ -1592,53 +1648,27 @@ export default function App() {
 
   const handleSelectWorkstream = (workstreamId: string) => {
     setReviewCycleOffset(0);
-    setState((prev) => {
-      if (!prev) return prev;
-
-      // Find the workstream to get its parent project
-      const ws = prev.nodes.find(
-        (n) => n.id === workstreamId && n.kind === 'workstream'
-      );
-
-      const projectId = ws?.parentId; // should be the parent project
-
-      return {
-        ...prev,
-        activeProjectId: projectId ?? prev.activeProjectId,
-        activeWorkstreamId: workstreamId,
-        activeTaskId: undefined,
-      };
-    });
+    setState((prev) =>
+      prev
+        ? {
+            ...prev,
+            activeWorkstreamId: workstreamId,
+            activeTaskId: undefined,
+          }
+        : prev
+    );
   };
 
   const handleSelectTask = (taskId: string) => {
     setReviewCycleOffset(0);
-    setState((prev) => {
-      if (!prev) return prev;
-
-      const task = prev.nodes.find(
-        (n) => n.id === taskId && n.kind === 'task'
-      );
-
-      let workstreamId = task?.parentId;
-      let projectId = prev.activeProjectId;
-
-      if (workstreamId) {
-        const ws = prev.nodes.find(
-          (n) => n.id === workstreamId && n.kind === 'workstream'
-        );
-        if (ws?.parentId) {
-          projectId = ws.parentId;
-        }
-      }
-
-      return {
-        ...prev,
-        activeProjectId: projectId,
-        activeWorkstreamId: workstreamId ?? prev.activeWorkstreamId,
-        activeTaskId: taskId,
-      };
-    });
+    setState((prev) =>
+      prev
+        ? {
+            ...prev,
+            activeTaskId: taskId,
+          }
+        : prev
+    );
   };
 
   const handleSetViewMode = (mode: ViewMode) => {
@@ -1752,29 +1782,10 @@ export default function App() {
     );
   };
 
-  // ---- Debug: reset all data ----
-  const handleResetAllData = async () => {
-    try {
-      await AsyncStorage.removeItem(STORAGE_KEY);
-    } catch (err) {
-      console.error('Failed to clear stored Cadence state:', err);
-    }
-
-    // Reset in-memory state
-    setState(initialState);
-    setReviewCycleOffset(0);
-    setShowAdvanced(false);
-  };
-
   // Workstream milestones toggle
   const toggleWorkstreamMilestones = () => {
     setState((prev) =>
-      prev
-        ? {
-            ...prev,
-            showWorkstreamMilestones: !prev.showWorkstreamMilestones,
-          }
-        : prev
+      prev ? { ...prev, showWorkstreamMilestones: !prev.showWorkstreamMilestones } : prev
     );
   };
 
@@ -1832,6 +1843,8 @@ export default function App() {
     );
   };
 
+  const currentLabelPrefix = getNodeLabelPrefix(currentNode.kind);
+
   // For context line under pills
   const currentTask = state.nodes.find(
     (n) => n.id === state.activeTaskId && n.kind === 'task' && !n.retired
@@ -1885,11 +1898,6 @@ export default function App() {
 
   const handleCreateWorkstream = () => {
     if (!state) return;
-    if (!state.activeProjectId) {
-      console.warn('Cannot create workstream without an active project.');
-      return;
-    }
-
     const name = newWorkstreamName.trim() || 'Untitled workstream';
     const newId = generateNodeId('workstream');
     const newNode: CadenceNode = {
@@ -1900,7 +1908,6 @@ export default function App() {
       cadence: 'weekly',
       cycles: [],
     };
-
     setState({
       ...state,
       nodes: [...state.nodes, newNode],
@@ -1913,11 +1920,6 @@ export default function App() {
 
   const handleCreateTask = () => {
     if (!state) return;
-    if (!state.activeWorkstreamId) {
-      console.warn('Cannot create task without an active workstream.');
-      return;
-    }
-
     const name = newTaskName.trim() || 'Untitled task';
     const newId = generateNodeId('task');
     const nowStr = formatISODate(new Date());
@@ -1940,7 +1942,6 @@ export default function App() {
       cadence: newTaskCadence,
       cycles: [newCycle],
     };
-
     setState({
       ...state,
       nodes: [...state.nodes, newNode],
@@ -1958,7 +1959,7 @@ export default function App() {
         {/* Header */}
         <Text style={styles.appTitle}>Cadence v2 Prototype</Text>
 
-        {/* Mode toggle + Help + Advanced */}
+        {/* Mode toggle */}
         <View style={styles.modeRow}>
           <ModePill
             label="Cadence Review"
@@ -1970,22 +1971,6 @@ export default function App() {
             active={state.viewMode === 'owners'}
             onPress={() => handleSetViewMode('owners')}
           />
-          <Pressable
-            onPress={() => setShowHelp((prev) => !prev)}
-            style={[
-              styles.helpPill,
-              showHelp && styles.helpPillActive,
-            ]}
-          >
-            <Text
-              style={[
-                styles.helpPillText,
-                showHelp && styles.helpPillTextActive,
-              ]}
-            >
-              Help
-            </Text>
-          </Pressable>
           <Pressable
             onPress={toggleAdvanced}
             style={[
@@ -2004,38 +1989,6 @@ export default function App() {
           </Pressable>
         </View>
 
-        {/* Help section */}
-        {showHelp && (
-          <View style={styles.section}>
-            <Text style={styles.sectionTitle}>How to use Cadence</Text>
-            <Text style={styles.cycleMetaSmall}>
-              1. <Text style={{ fontWeight: '600' }}>Set up your structure.</Text>{'\n'}
-              {'   '}• Create a <Text style={{ fontWeight: '600' }}>project</Text> (e.g. “North Star program”).{'\n'}
-              {'   '}• Under a project, create one or more <Text style={{ fontWeight: '600' }}>workstreams</Text>.{'\n'}
-              {'   '}• Under each workstream, create <Text style={{ fontWeight: '600' }}>tasks</Text> with owners and cadence.
-            </Text>
-            <Text style={styles.cycleMetaSmall}>
-              2. <Text style={{ fontWeight: '600' }}>During the period</Text> (week / month, etc.) update:{'\n'}
-              {'   '}• <Text style={{ fontWeight: '600' }}>Actuals</Text>: what really happened in this period.{'\n'}
-              {'   '}• <Text style={{ fontWeight: '600' }}>Next Plan</Text>: what you commit to for the next period.
-            </Text>
-            <Text style={styles.cycleMetaSmall}>
-              3. <Text style={{ fontWeight: '600' }}>Cadence Review ritual.</Text>{'\n'}
-              {'   '}• Use the <Text style={{ fontWeight: '600' }}>Cadence Review</Text> tab once per period.{'\n'}
-              {'   '}• Choose scope via the <Text style={{ fontWeight: '600' }}>project / workstream / task</Text> pills.{'\n'}
-              {'   '}• For the current period, review each task and click{' '}
-              <Text style={{ fontWeight: '600' }}>“Complete Update”</Text> when its Actuals and Next Plan are done.{'\n'}
-              {'   '}• When all tasks in scope are updated, use{' '}
-              <Text style={{ fontWeight: '600' }}>“Complete Period Update”</Text> at the bottom to close this period and open the next.
-            </Text>
-            <Text style={styles.cycleMetaSmall}>
-              4. <Text style={{ fontWeight: '600' }}>Other views.</Text>{'\n'}
-              {'   '}• <Text style={{ fontWeight: '600' }}>Owners</Text> view: see everything assigned to one person, across projects.{'\n'}
-              {'   '}• <Text style={{ fontWeight: '600' }}>Advanced → Open</Text> view: see and filter all open periods (overdue, due soon, etc.).
-            </Text>
-          </View>
-        )}
-
         {showAdvanced && (
           <View style={styles.modeRow}>
             <ModePill
@@ -2043,44 +1996,24 @@ export default function App() {
               active={state.viewMode === 'open'}
               onPress={() => handleSetViewMode('open')}
             />
-
-            {/* Debug reset */}
-            <Pressable
-              onPress={handleResetAllData}
-              style={styles.debugPill}
-            >
-              <Text style={styles.debugPillText}>Reset all data</Text>
-            </Pressable>
           </View>
         )}
 
-        {/* Tiny getting-started guide – only when no projects exist */}
-        {projects.length === 0 && (
-          <View style={styles.section}>
-            <Text style={styles.sectionTitle}>Getting started</Text>
-            <Text style={styles.cycleMetaSmall}>
-              1. Create a project using “＋ Add project”.{'\n'}
-              2. Add one or more workstreams under that project.{'\n'}
-              3. Add tasks under a workstream, then use “Cadence Review”
-              once per week to update Actuals and Next Plan.
-            </Text>
-          </View>
-        )}
-
+        {/* Open-mode mini summary bar */}
         {state.viewMode !== 'open' && (
           <View style={styles.openSummaryBar}>
             <Text style={styles.openSummaryText}>
-              Open periods: {openEntriesAll.length} (Overdue:{' '}
+              Open PPP periods: {openEntriesAll.length} (Overdue:{' '}
               {overdueCount}, Due soon: {dueSoonCount})
             </Text>
-            {earliestTargetEndLabel ? (
+            {earliestTargetEnd ? (
               <Text style={styles.openSummaryHint}>
-                Next checkpoint: {earliestTargetEndLabel}. Switch to
+                Next checkpoint: {formatISODate(earliestTargetEnd)}. Switch to
                 Advanced → "Open" mode to review & complete.
               </Text>
             ) : (
               <Text style={styles.openSummaryHint}>
-                No upcoming checkpoints. All tracked periods are closed.
+                No upcoming checkpoints. All PPP periods are closed.
               </Text>
             )}
           </View>
@@ -2112,7 +2045,7 @@ export default function App() {
         {/* Open-mode filters */}
         {state.viewMode === 'open' && (
           <View style={styles.section}>
-            <Text style={styles.sectionTitle}>Open Period Filters</Text>
+            <Text style={styles.sectionTitle}>Open PPP Filters</Text>
 
             {/* Owner filter */}
             <Text style={styles.selectorLabel}>Owner</Text>
@@ -2229,7 +2162,6 @@ export default function App() {
               onPress={clearProjectSelection}
             />
           )}
-
           {projects.map((p) => {
             const highlighted =
               state.viewMode === 'owners' &&
@@ -2306,11 +2238,7 @@ export default function App() {
             style={styles.linkText}
             onPress={toggleWorkstreamMilestones}
           >
-            [
-            {state.showWorkstreamMilestones
-              ? 'Hide milestones'
-              : 'Show milestones'}
-            ]
+            [{state.showWorkstreamMilestones ? 'Hide milestones' : 'Show milestones'}]
           </Text>
         </Text>
         <View style={styles.pillRow}>
@@ -2356,18 +2284,10 @@ export default function App() {
             })
           )}
 
-          {/* Add Workstream pill (requires active project) */}
+          {/* Add Workstream pill */}
           <Pressable
-            style={[
-              styles.addPill,
-              !state.activeProjectId && styles.addPillDisabled,
-            ]}
-            onPress={() => {
-              if (!state.activeProjectId) {
-                return; // require a selected project
-              }
-              setIsCreatingWorkstream(true);
-            }}
+            style={styles.addPill}
+            onPress={() => setIsCreatingWorkstream(true)}
           >
             <Text style={styles.addPillText}>＋ Add workstream</Text>
           </Pressable>
@@ -2450,7 +2370,6 @@ export default function App() {
               onPress={clearTaskSelection}
             />
           )}
-
           {tasks.length === 0 ? (
             <Text style={styles.cycleMetaSmall}>No tasks yet.</Text>
           ) : (
@@ -2484,23 +2403,13 @@ export default function App() {
             })
           )}
 
-          {/* Add Task pill (requires active workstream) */}
-          {state.viewMode !== 'owners' && (
-            <Pressable
-              style={[
-                styles.addPill,
-                !state.activeWorkstreamId && styles.addPillDisabled,
-              ]}
-              onPress={() => {
-                if (!state.activeWorkstreamId) {
-                  return;
-                }
-                setIsCreatingTask(true);
-              }}
-            >
-              <Text style={styles.addPillText}>＋ Add task</Text>
-            </Pressable>
-          )}
+          {/* Add Task pill */}
+          <Pressable
+            style={styles.addPill}
+            onPress={() => setIsCreatingTask(true)}
+          >
+            <Text style={styles.addPillText}>＋ Add task</Text>
+          </Pressable>
         </View>
 
         {/* New Task entry row */}
@@ -2520,33 +2429,27 @@ export default function App() {
             />
             <View style={styles.cadencePickerRow}>
               <Text style={styles.cadencePickerLabel}>Cadence:</Text>
-              {(
-                [
-                  'daily',
-                  'weekly',
-                  'biweekly',
-                  'monthly',
-                  'quarterly',
-                ] as CadenceType[]
-              ).map((c) => (
-                <Pressable
-                  key={c}
-                  style={[
-                    styles.cadenceChip,
-                    newTaskCadence === c && styles.cadenceChipActive,
-                  ]}
-                  onPress={() => setNewTaskCadence(c)}
-                >
-                  <Text
+              {(['daily', 'weekly', 'biweekly', 'monthly', 'quarterly'] as CadenceType[]).map(
+                (c) => (
+                  <Pressable
+                    key={c}
                     style={[
-                      styles.cadenceChipText,
-                      newTaskCadence === c && styles.cadenceChipTextActive,
+                      styles.cadenceChip,
+                      newTaskCadence === c && styles.cadenceChipActive,
                     ]}
+                    onPress={() => setNewTaskCadence(c)}
                   >
-                    {c}
-                  </Text>
-                </Pressable>
-              ))}
+                    <Text
+                      style={[
+                        styles.cadenceChipText,
+                        newTaskCadence === c && styles.cadenceChipTextActive,
+                      ]}
+                    >
+                      {c}
+                    </Text>
+                  </Pressable>
+                )
+              )}
             </View>
             <View style={styles.createActionsRow}>
               <Pressable
@@ -2621,21 +2524,6 @@ export default function App() {
 // ---- Styles ----
 
 const styles = StyleSheet.create({
-  debugPill: {
-    paddingVertical: 4,
-    paddingHorizontal: 8,
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: '#ef9a9a',
-    backgroundColor: '#ffebee',
-    marginLeft: 8,
-  },
-  debugPillText: {
-    fontSize: 11,
-    fontWeight: '600',
-    color: '#b71c1c',
-  },
-
   safeArea: {
     flex: 1,
     backgroundColor: '#f3f3f3',
@@ -2763,27 +2651,6 @@ const styles = StyleSheet.create({
     color: '#880e4f',
     fontWeight: '600',
   },
-  // Help pill
-  helpPill: {
-    paddingVertical: 4,
-    paddingHorizontal: 8,
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: '#c5cae9',
-    backgroundColor: '#e8eaf6',
-  },
-  helpPillActive: {
-    backgroundColor: '#c5cae9',
-    borderColor: '#9fa8da',
-  },
-  helpPillText: {
-    fontSize: 12,
-    color: '#283593',
-  },
-  helpPillTextActive: {
-    fontWeight: '600',
-    color: '#1a237e',
-  },
   // Advanced toggle
   advancedToggle: {
     paddingVertical: 4,
@@ -2792,7 +2659,6 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#ccc',
     backgroundColor: '#fafafa',
-    marginLeft: 'auto',
   },
   advancedToggleActive: {
     backgroundColor: '#fffde7',
@@ -2863,7 +2729,7 @@ const styles = StyleSheet.create({
   selectorPillTextDisabled: {
     color: '#777',
   },
-  // Cadence table styles
+  // PPP table styles
   pppHeaderRow: {
     flexDirection: 'row',
     marginTop: 8,
@@ -2886,11 +2752,6 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '600',
     color: '#444',
-  },
-  pppHeaderSubText: {
-    fontSize: 10,
-    color: '#777',
-    marginTop: 2,
   },
   pppRow: {
     flexDirection: 'row',
@@ -3002,7 +2863,7 @@ const styles = StyleSheet.create({
     marginTop: 6,
     marginBottom: 4,
     flexDirection: 'row',
-    justifyContent: 'flex-end',
+    justifyContent: 'space-between',
     alignItems: 'center',
   },
   cycleNavText: {
@@ -3078,12 +2939,6 @@ const styles = StyleSheet.create({
     color: '#e65100',
     fontWeight: '600',
   },
-  addPillDisabled: {
-    opacity: 0.5,
-    backgroundColor: '#f5f5f5',
-    borderColor: '#e0e0e0',
-  },
-
   // Create rows
   createRow: {
     marginTop: 4,
