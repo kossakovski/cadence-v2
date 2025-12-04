@@ -10,6 +10,10 @@ import {
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
+// ---- Stage 0 LLM onboarding screen ----
+
+import SetupScreen from './screens/SetupScreen';
+
 // ---- Domain types ----
 
 type CadenceKind = 'project' | 'workstream' | 'task';
@@ -65,6 +69,18 @@ interface AppState {
   // Workstream milestone toggle
   showWorkstreamMilestones: boolean;
 }
+type SetupResult = {
+  projectName: string;
+  workstreams: {
+    name: string;
+    tasks: {
+      name: string;
+      owner?: string;
+      cadence?: CadenceType;
+    }[];
+  }[];
+};
+
 
 // ---- Initial sample state ----
 
@@ -329,7 +345,31 @@ function getDueStateForCycle(
 
 function closeCurrentCycle(node: CadenceNode): CadenceNode {
   const current = getCurrentCycle(node);
-  const now = new Date();
+  const len = getPeriodLengthDays(node.cadence);
+
+  let closedEnd: Date;
+  let nextStart: Date;
+
+  if (current.startDate) {
+    // Normal case: derive everything from the period start + cadence
+    const start = parseISODate(current.startDate);
+    closedEnd = addDays(start, len - 1); // end of this period
+    nextStart = addDays(start, len);     // start of next period
+  } else if (current.endDate) {
+    // Fallback: if we somehow only have an end date
+    const end = parseISODate(current.endDate);
+    closedEnd = end;
+    nextStart = addDays(end, 1);
+  } else {
+    // Last-resort fallback: use "today"
+    const today = new Date();
+    closedEnd = today;
+    nextStart = addDays(today, len);
+  }
+
+  const closedEndStr = formatISODate(closedEnd);
+  const nextStartStr = formatISODate(nextStart);
+
   const nextIndex = node.cycles.length;
 
   const closedCycles: CadenceCycle[] = node.cycles.map((c: CadenceCycle) =>
@@ -337,7 +377,7 @@ function closeCurrentCycle(node: CadenceNode): CadenceNode {
       ? {
           ...c,
           status: 'closed' as CycleStatus,
-          endDate: formatISODate(now),
+          endDate: closedEndStr,
         }
       : c
   );
@@ -346,7 +386,7 @@ function closeCurrentCycle(node: CadenceNode): CadenceNode {
     id: `${node.id}-period-${nextIndex + 1}`,
     index: nextIndex,
     status: 'open',
-    startDate: formatISODate(now),
+    startDate: nextStartStr,
     previousPlan: current.nextPlan || '(carry-over plan)',
     actuals: '',
     nextPlan: '',
@@ -359,6 +399,7 @@ function closeCurrentCycle(node: CadenceNode): CadenceNode {
     cycles: [...closedCycles, newCycle],
   };
 }
+
 
 // ---- Cadence helpers ----
 
@@ -833,7 +874,7 @@ const ReviewSection: React.FC<ReviewSectionProps> = ({
   const visiblePrimaryCycle =
     primarySortedCycles[Math.max(0, visibleIdx)] || primarySortedCycles[0];
 
-  // Header date ranges for Previous / Actuals / Next
+    // Header date ranges for Previous / Actuals / Next
   const cadenceLabel = getCadenceLabel(primaryNode.cadence);
   const nextRange = getNextPeriodRange(primaryNode, visiblePrimaryCycle);
 
@@ -848,25 +889,14 @@ const ReviewSection: React.FC<ReviewSectionProps> = ({
   }
   const actualRangeLabel = formatHumanDateRange(actualStart, actualEnd);
 
-  // Previous Plan = previous cycle, if any
-  let previousRangeLabel: string | undefined;
-  if (visibleIdx > 0 && totalCycles > 1) {
-    const prevCycle = primarySortedCycles[visibleIdx - 1];
-    const prevStart = prevCycle.startDate;
-    let prevEnd = prevCycle.endDate;
-    if (!prevEnd) {
-      const prevTargetEnd = getTargetEndDate(primaryNode, prevCycle);
-      if (prevTargetEnd) {
-        prevEnd = formatISODate(prevTargetEnd);
-      }
-    }
-    previousRangeLabel = formatHumanDateRange(prevStart, prevEnd);
-  }
+  // Previous Plan = same period as Actuals
+  const previousRangeLabel = actualRangeLabel;
 
   // Next Plan = next period range
   const nextRangeLabel = nextRange
     ? formatHumanDateRange(nextRange.start, nextRange.end)
     : undefined;
+
 
   // Simple label text for the top line
   const nextPlanHeader = 'Next Plan';
@@ -1311,6 +1341,9 @@ export default function App() {
   // Advanced toggle
   const [showAdvanced, setShowAdvanced] = useState(false);
 
+  // Stage 0 SetupScreen toggle (not persisted yet – MVP)
+  const [showSetup, setShowSetup] = useState(true);
+
   // Create-new local UI state
   const [isCreatingProject, setIsCreatingProject] = useState(false);
   const [newProjectName, setNewProjectName] = useState('');
@@ -1343,6 +1376,87 @@ export default function App() {
     loadState();
   }, []);
 
+  const handleSetupComplete = (data: SetupResult) => {
+    const nowStr = formatISODate(new Date());
+
+    const projectId = generateNodeId('project');
+
+    const projectNode: CadenceNode = {
+      id: projectId,
+      kind: 'project',
+      name: data.projectName || 'My first cadence project',
+      cadence: 'weekly',
+      cycles: [],
+    };
+
+    const workstreamNodes: CadenceNode[] = [];
+    const taskNodes: CadenceNode[] = [];
+
+    data.workstreams.forEach((ws) => {
+      const wsId = generateNodeId('workstream');
+
+      const wsNode: CadenceNode = {
+        id: wsId,
+        kind: 'workstream',
+        parentId: projectId,
+        name: ws.name || 'Workstream',
+        cadence: 'weekly',
+        cycles: [],
+      };
+      workstreamNodes.push(wsNode);
+
+      ws.tasks.forEach((task) => {
+        const taskId = generateNodeId('task');
+        const cadence = task.cadence || 'weekly';
+
+        const firstCycle: CadenceCycle = {
+          id: `${taskId}-period-1`,
+          index: 0,
+          status: 'open',
+          startDate: nowStr,
+          previousPlan: '',
+          actuals: '',
+          nextPlan: '',
+          owner: (task.owner || '').trim(),
+          reviewed: false,
+        };
+
+        const taskNode: CadenceNode = {
+          id: taskId,
+          kind: 'task',
+          parentId: wsId,
+          name: task.name || 'Task',
+          cadence,
+          cycles: [firstCycle],
+        };
+
+        taskNodes.push(taskNode);
+      });
+    });
+
+    const allNodes = [projectNode, ...workstreamNodes, ...taskNodes];
+
+    setState((prev) => ({
+      ...prev,
+      nodes: allNodes,
+      activeProjectId: projectId,
+      activeWorkstreamId: workstreamNodes[0]?.id,
+      activeTaskId: taskNodes[0]?.id,
+      viewMode: 'review',
+    }));
+
+    // Optional: reset review cycle offset to latest
+    setReviewCycleOffset(0);
+  };
+
+
+  // If we already have nodes from a previous run, skip SetupScreen
+  useEffect(() => {
+    if (isHydrated && state.nodes.length > 0) {
+      setShowSetup(false);
+    }
+  }, [isHydrated, state.nodes.length]);
+
   // Persist state whenever it changes (after hydration)
   useEffect(() => {
     if (!isHydrated) return; // prevent overwriting before load finishes
@@ -1357,6 +1471,8 @@ export default function App() {
     saveState();
   }, [state, isHydrated]);
 
+
+  
   const inOwnersMode = state.viewMode === 'owners';
   const inReviewMode = state.viewMode === 'review';
 
@@ -1394,8 +1510,31 @@ export default function App() {
       </SafeAreaView>
     );
   }
+  // Show tiny loading state while hydrating from AsyncStorage
+  if (!isHydrated) {
+    return (
+      <SafeAreaView style={styles.safeArea}>
+        <View style={[styles.scrollContent, { justifyContent: 'center' }]}>
+          <Text style={styles.appTitle}>Cadence v2 Prototype</Text>
+          <Text style={styles.nodeSubtitle}>Loading your cadence…</Text>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  // 👉 Stage 0 Setup Wizard: when there is no structure yet
+  if (state.nodes.length === 0) {
+    return (
+      <SafeAreaView style={styles.safeArea}>
+        <ScrollView contentContainerStyle={styles.scrollContent}>
+          <SetupScreen onComplete={handleSetupComplete} />
+        </ScrollView>
+      </SafeAreaView>
+    );
+  }
 
   const today = new Date();
+  // ... rest of your existing App code
 
   // ---- Open mode data ----
   const openEntriesAll: OpenEntry[] = state.nodes.flatMap((node) => {
@@ -1764,6 +1903,7 @@ export default function App() {
     setState(initialState);
     setReviewCycleOffset(0);
     setShowAdvanced(false);
+    setShowSetup(true); // show Setup again after full reset
   };
 
   // Workstream milestones toggle
@@ -1970,6 +2110,7 @@ export default function App() {
             active={state.viewMode === 'owners'}
             onPress={() => handleSetViewMode('owners')}
           />
+        {/* Help + Advanced */}
           <Pressable
             onPress={() => setShowHelp((prev) => !prev)}
             style={[
