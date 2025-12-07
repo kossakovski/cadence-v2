@@ -7,8 +7,11 @@ import {
   TextInput,
   StyleSheet,
   Pressable,
+  Platform,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import DateTimePicker from '@react-native-community/datetimepicker';
+
 
 // ---- Stage 0 LLM onboarding screen ----
 
@@ -69,6 +72,7 @@ interface AppState {
   // Workstream milestone toggle
   showWorkstreamMilestones: boolean;
 }
+
 type SetupResult = {
   projectName: string;
   workstreams: {
@@ -80,7 +84,6 @@ type SetupResult = {
     }[];
   }[];
 };
-
 
 // ---- Initial sample state ----
 
@@ -400,7 +403,6 @@ function closeCurrentCycle(node: CadenceNode): CadenceNode {
   };
 }
 
-
 // ---- Cadence helpers ----
 
 function getCadenceLabel(cadence: CadenceType): string {
@@ -517,14 +519,17 @@ function getOwnerSummaries(nodes: CadenceNode[]): OwnerSummary[] {
 }
 
 // ---- Cadence header ----
-
 interface PPPHeaderProps {
   nextPlanHeader: string;
   showActions?: boolean;
   previousDateLabel?: string;
   actualDateLabel?: string;
   nextDateLabel?: string;
+  previousLocked?: boolean;  // show red "Locked" tag
+  actualEditable?: boolean;  // show green "Editable" tag under Actuals
+  nextEditable?: boolean;    // show green "Editable" tag under Next Plan
 }
+
 
 const PPPHeaderRow: React.FC<PPPHeaderProps> = ({
   nextPlanHeader,
@@ -532,33 +537,50 @@ const PPPHeaderRow: React.FC<PPPHeaderProps> = ({
   previousDateLabel,
   actualDateLabel,
   nextDateLabel,
+  previousLocked,
+  actualEditable,
+  nextEditable,
 }) => (
   <View style={styles.pppHeaderRow}>
+    {/* Object column */}
     <View style={[styles.pppHeaderCell, styles.pppObjectHeaderCell]}>
       <Text style={styles.pppHeaderText}>Object</Text>
     </View>
 
+    {/* Previous Plan */}
     <View style={styles.pppHeaderCell}>
       <Text style={styles.pppHeaderText}>Previous Plan</Text>
       {previousDateLabel ? (
         <Text style={styles.pppHeaderSubText}>{previousDateLabel}</Text>
       ) : null}
+      {previousLocked && (
+        <Text style={styles.pppHeaderLockedTag}>Locked</Text>
+      )}
     </View>
 
+    {/* Actuals */}
     <View style={styles.pppHeaderCell}>
       <Text style={styles.pppHeaderText}>Actuals</Text>
       {actualDateLabel ? (
         <Text style={styles.pppHeaderSubText}>{actualDateLabel}</Text>
       ) : null}
+      {actualEditable && (
+        <Text style={styles.pppHeaderEditableTag}>Editable</Text>
+      )}
     </View>
 
+    {/* Next Plan */}
     <View style={styles.pppHeaderCell}>
       <Text style={styles.pppHeaderText}>{nextPlanHeader}</Text>
       {nextDateLabel ? (
         <Text style={styles.pppHeaderSubText}>{nextDateLabel}</Text>
       ) : null}
+      {nextEditable && (
+        <Text style={styles.pppHeaderEditableTag}>Editable</Text>
+      )}
     </View>
 
+    {/* Optional Actions column */}
     {showActions && (
       <View style={[styles.pppHeaderCell, styles.pppActionsHeaderCell]}>
         <Text style={styles.pppHeaderText}>Actions</Text>
@@ -566,6 +588,8 @@ const PPPHeaderRow: React.FC<PPPHeaderProps> = ({
     )}
   </View>
 );
+
+
 
 // ---- Cadence row (read-only or editable for current open period) ----
 
@@ -874,7 +898,7 @@ const ReviewSection: React.FC<ReviewSectionProps> = ({
   const visiblePrimaryCycle =
     primarySortedCycles[Math.max(0, visibleIdx)] || primarySortedCycles[0];
 
-    // Header date ranges for Previous / Actuals / Next
+  // Header date ranges for Previous / Actuals / Next
   const cadenceLabel = getCadenceLabel(primaryNode.cadence);
   const nextRange = getNextPeriodRange(primaryNode, visiblePrimaryCycle);
 
@@ -897,9 +921,12 @@ const ReviewSection: React.FC<ReviewSectionProps> = ({
     ? formatHumanDateRange(nextRange.start, nextRange.end)
     : undefined;
 
-
-  // Simple label text for the top line
+     // Simple label text for the top line
   const nextPlanHeader = 'Next Plan';
+  const isCurrentPeriod = reviewCycleOffset === 0;
+  const editableTag = isCurrentPeriod ? 'Editable' : undefined;
+
+
 
   const canGoPrev = clampedOffset < totalCycles - 1;
   const canGoNext = clampedOffset > 0;
@@ -922,7 +949,7 @@ const ReviewSection: React.FC<ReviewSectionProps> = ({
   };
 
   // Compute task-level review summary for current period
-  const isCurrentPeriod = reviewCycleOffset === 0;
+  
   const taskRows = rows.filter((n) => n.kind === 'task');
   const openTaskCycles = isCurrentPeriod
     ? taskRows.map((node) => {
@@ -958,6 +985,14 @@ const ReviewSection: React.FC<ReviewSectionProps> = ({
       </Text>
       {scopeOwnerLabel && (
         <Text style={styles.cycleMetaSmall}>{scopeOwnerLabel}</Text>
+      )}
+
+      {isCurrentPeriod && (
+        <Text style={styles.cycleMetaSmall}>
+          {totalOpenTasksInScope === 0
+            ? 'No open tasks in this scope for the current period.'
+            : `${reviewedTasksInScope} of ${totalOpenTasksInScope} open tasks updated in this scope.`}
+        </Text>
       )}
 
       {/* Period navigation row */}
@@ -1009,13 +1044,18 @@ const ReviewSection: React.FC<ReviewSectionProps> = ({
         </View>
       </View>
 
-      <PPPHeaderRow
-        nextPlanHeader={nextPlanHeader}
-        previousDateLabel={previousRangeLabel}
-        actualDateLabel={actualRangeLabel}
-        nextDateLabel={nextRangeLabel}
-        showActions
-      />
+           <PPPHeaderRow
+    nextPlanHeader={nextPlanHeader}
+    previousDateLabel={previousRangeLabel}
+    actualDateLabel={actualRangeLabel}
+    nextDateLabel={nextRangeLabel}
+    previousLocked={true}
+    actualEditable={isCurrentPeriod}
+    nextEditable={isCurrentPeriod}
+    showActions
+  />
+
+
 
       {rows.map((node) => {
         const cycle = getVisibleCycleForNode(node, reviewCycleOffset);
@@ -1057,12 +1097,11 @@ const ReviewSection: React.FC<ReviewSectionProps> = ({
         <View style={styles.periodFooter}>
           {totalOpenTasksInScope === 0 ? (
             <Text style={styles.periodFooterText}>
-              No open tasks in this scope for the current period.
+              No open tasks to complete for this period.
             </Text>
           ) : (
             <Text style={styles.periodFooterText}>
-              {reviewedTasksInScope} of {totalOpenTasksInScope} tasks
-              updated.
+              When all tasks in this scope are updated, you can complete the period.
             </Text>
           )}
           <Pressable
@@ -1117,10 +1156,78 @@ const OwnersOverviewSection: React.FC<OwnersOverviewSectionProps> = ({
     );
   }
 
-  const nextPlanHeader = 'Next Plan (current periods)';
+     const nextPlanHeader = 'Next Plan';
   const visibleEntries = summary.entries.filter((e) =>
     visibleNodeIds.includes(e.node.id)
   );
+
+  const editableTag = 'Editable';
+
+  let previousDateLabel: string | undefined = undefined;
+  let actualDateLabel: string | undefined = undefined;
+  let nextDateLabel: string | undefined = undefined;
+
+  if (visibleEntries.length > 0) {
+    const starts: string[] = [];
+    const ends: string[] = [];
+
+    visibleEntries.forEach(({ node, cycle }) => {
+      if (cycle.startDate) {
+        starts.push(cycle.startDate);
+      }
+
+      let endStr = cycle.endDate;
+      if (!endStr) {
+        const targetEnd = getTargetEndDate(node, cycle);
+        if (targetEnd) {
+          endStr = formatISODate(targetEnd);
+        }
+      }
+      if (endStr) {
+        ends.push(endStr);
+      }
+    });
+
+    if (starts.length > 0 || ends.length > 0) {
+      const minStart = starts.length > 0 ? starts.sort()[0] : undefined;
+      const maxEnd =
+        ends.length > 0 ? ends.sort()[ends.length - 1] : undefined;
+
+      const rangeLabel = formatHumanDateRange(minStart, maxEnd);
+
+      actualDateLabel = rangeLabel;
+      previousDateLabel = rangeLabel;
+      nextDateLabel = rangeLabel;
+    }
+  }
+
+
+  // Derive date labels from the first visible entry (similar to ReviewSection)
+  let previousRangeLabel: string | undefined;
+  let actualRangeLabel: string | undefined;
+  let nextRangeLabel: string | undefined;
+
+  if (visibleEntries.length > 0) {
+    const primaryNode = visibleEntries[0].node;
+    const primaryCycle = visibleEntries[0].cycle;
+
+    const nextRange = getNextPeriodRange(primaryNode, primaryCycle);
+
+    const actualStart = primaryCycle.startDate;
+    let actualEnd = primaryCycle.endDate;
+    if (!actualEnd) {
+      const targetEnd = getTargetEndDate(primaryNode, primaryCycle);
+      if (targetEnd) {
+        actualEnd = formatISODate(targetEnd);
+      }
+    }
+
+    actualRangeLabel = formatHumanDateRange(actualStart, actualEnd);
+    previousRangeLabel = actualRangeLabel;
+    nextRangeLabel = nextRange
+      ? formatHumanDateRange(nextRange.start, nextRange.end)
+      : undefined;
+  }
 
   return (
     <View style={styles.section}>
@@ -1134,7 +1241,17 @@ const OwnersOverviewSection: React.FC<OwnersOverviewSectionProps> = ({
         </Text>
       ) : (
         <>
-          <PPPHeaderRow nextPlanHeader={nextPlanHeader} />
+                     <PPPHeaderRow
+    nextPlanHeader={nextPlanHeader}
+    previousDateLabel={previousDateLabel}  // if you already compute these
+    actualDateLabel={actualDateLabel}
+    nextDateLabel={nextDateLabel}
+    previousLocked={true}
+    actualEditable={true}
+    nextEditable={true}
+  />
+
+
           {visibleEntries.map(({ node, cycle }) => (
             <PPPRow
               key={node.id}
@@ -1151,6 +1268,7 @@ const OwnersOverviewSection: React.FC<OwnersOverviewSectionProps> = ({
     </View>
   );
 };
+
 
 // ---- Open mode section (All open periods) ----
 
@@ -1356,6 +1474,8 @@ export default function App() {
   const [newTaskOwner, setNewTaskOwner] = useState('');
   const [newTaskCadence, setNewTaskCadence] =
     useState<CadenceType>('weekly');
+  const [milestonePickerWsId, setMilestonePickerWsId] = useState<string | null>(null);
+  const [milestonePickerDate, setMilestonePickerDate] = useState<Date | null>(null);
 
   // Load persisted state on mount
   useEffect(() => {
@@ -1449,7 +1569,6 @@ export default function App() {
     setReviewCycleOffset(0);
   };
 
-
   // If we already have nodes from a previous run, skip SetupScreen
   useEffect(() => {
     if (isHydrated && state.nodes.length > 0) {
@@ -1471,8 +1590,6 @@ export default function App() {
     saveState();
   }, [state, isHydrated]);
 
-
-  
   const inOwnersMode = state.viewMode === 'owners';
   const inReviewMode = state.viewMode === 'review';
 
@@ -1534,7 +1651,6 @@ export default function App() {
   }
 
   const today = new Date();
-  // ... rest of your existing App code
 
   // ---- Open mode data ----
   const openEntriesAll: OpenEntry[] = state.nodes.flatMap((node) => {
@@ -2110,7 +2226,7 @@ export default function App() {
             active={state.viewMode === 'owners'}
             onPress={() => handleSetViewMode('owners')}
           />
-        {/* Help + Advanced */}
+          {/* Help + Advanced */}
           <Pressable
             onPress={() => setShowHelp((prev) => !prev)}
             style={[
@@ -2150,7 +2266,8 @@ export default function App() {
           <View style={styles.section}>
             <Text style={styles.sectionTitle}>How to use Cadence</Text>
             <Text style={styles.cycleMetaSmall}>
-              1. <Text style={{ fontWeight: '600' }}>Set up your structure.</Text>{'\n'}
+              1. <Text style={{ fontWeight: '600' }}>Set up your structure.</Text>
+              {'\n'}
               {'   '}• Create a <Text style={{ fontWeight: '600' }}>project</Text> (e.g. “North Star program”).{'\n'}
               {'   '}• Under a project, create one or more <Text style={{ fontWeight: '600' }}>workstreams</Text>.{'\n'}
               {'   '}• Under each workstream, create <Text style={{ fontWeight: '600' }}>tasks</Text> with owners and cadence.
@@ -2546,40 +2663,87 @@ export default function App() {
         )}
 
         {/* Workstream milestones section */}
-        {state.showWorkstreamMilestones && workstreams.length > 0 && (
-          <View style={styles.section}>
-            <Text style={styles.sectionTitle}>Workstream Milestones</Text>
-            {workstreams.map((ws) => (
-              <View key={ws.id} style={styles.milestoneRow}>
-                <Text style={styles.milestoneWsName}>{ws.name}</Text>
-                <TextInput
-                  style={styles.milestoneInput}
-                  placeholder="Milestone"
-                  value={ws.milestone || ''}
-                  onChangeText={(text) =>
-                    handleUpdateWorkstreamMilestone(
-                      ws.id,
-                      'milestone',
-                      text
-                    )
+{state.showWorkstreamMilestones && workstreams.length > 0 && (
+  <View style={styles.section}>
+    <Text style={styles.sectionTitle}>Workstream Milestones</Text>
+    {workstreams.map((ws) => (
+      <View key={ws.id} style={styles.milestoneRow}>
+        <Text style={styles.milestoneWsName}>{ws.name}</Text>
+
+        {/* Milestone text */}
+        <TextInput
+          style={styles.milestoneInput}
+          placeholder="Milestone"
+          value={ws.milestone || ''}
+          onChangeText={(text) =>
+            handleUpdateWorkstreamMilestone(ws.id, 'milestone', text)
+          }
+        />
+
+        {/* Milestone date: web = text input, native = date picker */}
+        {Platform.OS === 'web' ? (
+          // --- Web: simple text input fallback ---
+          <TextInput
+            style={styles.milestoneDateInput}
+            placeholder="YYYY-MM-DD"
+            value={ws.milestoneDate || ''}
+            onChangeText={(text) =>
+              handleUpdateWorkstreamMilestone(ws.id, 'milestoneDate', text)
+            }
+          />
+        ) : (
+          // --- Native (iOS / Android): calendar picker ---
+          <>
+            <Pressable
+              style={styles.milestoneDateInput}
+              onPress={() => {
+                const baseDate = ws.milestoneDate
+                  ? parseISODate(ws.milestoneDate)
+                  : new Date();
+                setMilestonePickerWsId(ws.id);
+                setMilestonePickerDate(baseDate);
+              }}
+            >
+              <Text style={styles.milestoneDateText}>
+                {ws.milestoneDate
+                  ? formatHumanDate(ws.milestoneDate) // e.g. "December 6"
+                  : 'Pick date'}
+              </Text>
+            </Pressable>
+
+            {milestonePickerWsId === ws.id && milestonePickerDate && (
+              <DateTimePicker
+                value={milestonePickerDate}
+                mode="date"
+                display="default"
+                onChange={(event, selectedDate) => {
+                  // User cancelled
+                  // @ts-ignore – event.type exists at runtime on native
+                  if (event.type === 'dismissed') {
+                    setMilestonePickerWsId(null);
+                    setMilestonePickerDate(null);
+                    return;
                   }
-                />
-                <TextInput
-                  style={styles.milestoneDateInput}
-                  placeholder="YYYY-MM-DD"
-                  value={ws.milestoneDate || ''}
-                  onChangeText={(text) =>
-                    handleUpdateWorkstreamMilestone(
-                      ws.id,
-                      'milestoneDate',
-                      text
-                    )
+
+                  const d = selectedDate || milestonePickerDate;
+                  setMilestonePickerDate(d);
+                  const iso = formatISODate(d);
+                  handleUpdateWorkstreamMilestone(ws.id, 'milestoneDate', iso);
+
+                  // On iOS the picker stays open, so close it after selection.
+                  if (Platform.OS !== 'android') {
+                    setMilestonePickerWsId(null);
+                    setMilestonePickerDate(null);
                   }
-                />
-              </View>
-            ))}
-          </View>
+                }}
+              />
+            )}
+          </>
         )}
+      </View>
+    ))}
+  </View>
+)}
 
         {/* Task pills */}
         <Text style={styles.selectorLabel}>Tasks</Text>
@@ -3023,16 +3187,38 @@ const styles = StyleSheet.create({
     flex: 0.8,
     alignItems: 'center',
   },
-  pppHeaderText: {
-    fontSize: 12,
-    fontWeight: '600',
-    color: '#444',
+    pppHeaderText: {
+    fontSize: 14,          // bigger
+    fontWeight: '700',     // bolder
+    color: '#333',
   },
   pppHeaderSubText: {
+    fontSize: 12,          // bigger
+    color: '#555',
+    marginTop: 2,
+    fontWeight: '500',
+  },
+
+    pppHeaderEditableTag: {
     fontSize: 10,
-    color: '#777',
+    fontWeight: '700',
+    color: '#2e7d32', // green
     marginTop: 2,
   },
+  pppHeaderLockedTag: {
+    fontSize: 10,
+    fontWeight: '700',
+    color: '#c62828', // red
+    marginTop: 2,
+  },
+
+  pppHeaderEditHint: {
+    fontSize: 10,
+    color: '#b26a00',      // subtle amber/orange hint
+    marginTop: 2,
+    fontStyle: 'italic',
+  },
+
   pppRow: {
     flexDirection: 'row',
     marginTop: 6,
@@ -3345,6 +3531,11 @@ const styles = StyleSheet.create({
     backgroundColor: '#fafafa',
     width: 120,
   },
+    milestoneDateText: {
+    fontSize: 12,
+    color: '#333',
+  },
+
   linkText: {
     fontSize: 11,
     color: '#1976d2',
