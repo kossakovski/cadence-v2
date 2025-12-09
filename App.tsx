@@ -85,6 +85,13 @@ type SetupResult = {
   }[];
 };
 
+interface CadenceBackupV1 {
+  version: 1;
+  createdAt: string;
+  note?: string;
+  state: AppState;
+}
+
 // ---- Initial sample state ----
 
 const initialState: AppState = {
@@ -1462,6 +1469,12 @@ export default function App() {
   // Stage 0 SetupScreen toggle (not persisted yet – MVP)
   const [showSetup, setShowSetup] = useState(true);
 
+  // Backup / restore UI state
+  const [backupExportText, setBackupExportText] = useState('');
+  const [backupImportText, setBackupImportText] = useState('');
+  const [backupError, setBackupError] = useState<string | null>(null);
+  const [backupInfo, setBackupInfo] = useState<string | null>(null);
+
   // Create-new local UI state
   const [isCreatingProject, setIsCreatingProject] = useState(false);
   const [newProjectName, setNewProjectName] = useState('');
@@ -2007,6 +2020,177 @@ export default function App() {
     );
   };
 
+  // ---- Backup / Restore handlers ----
+
+  const handleDownloadBackupWeb = () => {
+    if (Platform.OS !== 'web') {
+      // Safety guard: this should only be used on web
+      return;
+    }
+
+    const payload: CadenceBackupV1 = {
+      version: 1,
+      createdAt: new Date().toISOString(),
+      state,
+    };
+
+    try {
+      const json = JSON.stringify(payload, null, 2);
+
+      // Use browser APIs via globalThis to avoid TS complaining about DOM types
+      const URLObj: any = (globalThis as any).URL || (window as any).URL;
+      const blob = new Blob([json], { type: 'application/json' });
+
+      const url = URLObj.createObjectURL(blob);
+      const doc: any = (globalThis as any).document;
+
+      if (!doc) {
+        console.warn('Document is not available; cannot trigger download.');
+        return;
+      }
+
+      const a = doc.createElement('a');
+      a.href = url;
+
+      const datePart = new Date().toISOString().slice(0, 10);
+      a.download = `cadence-backup-${datePart}.json`;
+
+      doc.body.appendChild(a);
+      a.click();
+      doc.body.removeChild(a);
+
+      URLObj.revokeObjectURL(url);
+      setBackupInfo('Backup file download started.');
+      setBackupError(null);
+    } catch (err) {
+      console.error('Failed to download backup:', err);
+      setBackupError('Failed to start backup file download.');
+      setBackupInfo(null);
+    }
+  };
+
+
+  const handleImportBackupFileWeb = () => {
+    if (Platform.OS !== 'web') {
+      // Safety guard: this should only be used on web
+      return;
+    }
+
+    try {
+      const doc: any = (globalThis as any).document;
+      if (!doc) {
+        setBackupError('Document is not available; cannot open file picker.');
+        setBackupInfo(null);
+        return;
+      }
+
+      const input = doc.createElement('input');
+      input.type = 'file';
+      input.accept = 'application/json,.json';
+
+      input.onchange = (event: any) => {
+        const file = event?.target?.files?.[0];
+        if (!file) {
+          return;
+        }
+
+        const reader = new FileReader();
+        reader.onload = () => {
+          try {
+            const text = String(reader.result || '');
+            setBackupImportText(text);
+            setBackupInfo(
+              'Backup file loaded. Review JSON below, then tap “Import backup”.'
+            );
+            setBackupError(null);
+          } catch (err) {
+            console.error('Failed to read backup file:', err);
+            setBackupError('Failed to read backup file.');
+            setBackupInfo(null);
+          }
+        };
+        reader.onerror = () => {
+          console.error('FileReader error while reading backup file.');
+          setBackupError('Failed to read backup file.');
+          setBackupInfo(null);
+        };
+
+        reader.readAsText(file);
+      };
+
+      input.click();
+    } catch (err) {
+      console.error('Failed to open file picker:', err);
+      setBackupError('Failed to open file picker for backup import.');
+      setBackupInfo(null);
+    }
+  };
+
+
+  const handleGenerateBackup = () => {
+    // Wrap the current AppState into a versioned envelope
+    const payload: CadenceBackupV1 = {
+      version: 1,
+      createdAt: new Date().toISOString(),
+      state,
+    };
+
+    try {
+      const json = JSON.stringify(payload, null, 2);
+      setBackupExportText(json);
+      setBackupInfo('Backup generated. Copy and store it somewhere safe.');
+      setBackupError(null);
+    } catch (err) {
+      console.error('Failed to generate backup:', err);
+      setBackupError('Failed to generate backup JSON.');
+      setBackupInfo(null);
+    }
+  };
+
+  const handleImportBackup = () => {
+    try {
+      setBackupError(null);
+      setBackupInfo(null);
+
+      if (!backupImportText.trim()) {
+        throw new Error('Paste backup JSON into the Import box first.');
+      }
+
+      const parsed: any = JSON.parse(backupImportText);
+
+      if (!parsed || typeof parsed !== 'object') {
+        throw new Error('Backup JSON must be an object.');
+      }
+      if (parsed.version !== 1) {
+        throw new Error(
+          `Unsupported backup version: ${parsed.version ?? 'unknown'}.`
+        );
+      }
+      if (!parsed.state || typeof parsed.state !== 'object') {
+        throw new Error('Backup is missing a valid "state" field.');
+      }
+      if (!Array.isArray(parsed.state.nodes)) {
+        throw new Error('Backup "state.nodes" must be an array.');
+      }
+
+      const nextState: AppState = parsed.state;
+
+      // Apply imported state
+      setState(nextState);
+      // Reset some local UI (optional)
+      setReviewCycleOffset(0);
+      setShowAdvanced(false);
+
+      setBackupInfo('Backup imported successfully.');
+    } catch (err: any) {
+      console.error('Failed to import backup:', err);
+      setBackupError(
+        err?.message || 'Failed to import backup. Check the JSON and try again.'
+      );
+    }
+  };
+
+
   // ---- Debug: reset all data ----
   const handleResetAllData = async () => {
     try {
@@ -2311,6 +2495,93 @@ export default function App() {
             </Pressable>
           </View>
         )}
+
+        {showAdvanced && (
+          <View style={styles.section}>
+            <Text style={styles.sectionTitle}>Backup &amp; Restore (beta)</Text>
+            <Text style={styles.cycleMetaSmall}>
+              Export your entire cadence state as JSON, and import it later or in a
+              new version. This uses a simple versioned backup format (v1).
+            </Text>
+
+            {/* Info / error messages */}
+            {backupInfo ? (
+              <Text style={styles.backupInfoText}>{backupInfo}</Text>
+            ) : null}
+            {backupError ? (
+              <Text style={styles.backupErrorText}>{backupError}</Text>
+            ) : null}
+
+            {/* Export */}
+            <Text style={styles.fieldLabelSmall}>Export backup JSON</Text>
+            <Text style={styles.cycleMetaSmall}>
+              Tap “Generate backup” to create a JSON snapshot of your current data.
+              Copy and store it somewhere safe (notes, file, etc.).
+            </Text>
+                        <View style={styles.backupButtonRow}>
+              <Pressable
+                style={styles.backupButton}
+                onPress={handleGenerateBackup}
+              >
+                <Text style={styles.backupButtonText}>Generate backup</Text>
+              </Pressable>
+
+              {Platform.OS === 'web' && (
+                <Pressable
+                  style={[styles.backupButton, { marginLeft: 8 }]}
+                  onPress={handleDownloadBackupWeb}
+                >
+                  <Text style={styles.backupButtonText}>
+                    Download backup file
+                  </Text>
+                </Pressable>
+              )}
+            </View>
+
+            <TextInput
+              style={styles.backupTextArea}
+              multiline
+              editable={false}
+              value={backupExportText}
+              placeholder="Backup JSON will appear here."
+            />
+
+            {/* Import */}
+            <Text style={styles.fieldLabelSmall}>Import backup JSON</Text>
+            <Text style={styles.cycleMetaSmall}>
+              Paste JSON from a previous export and tap “Import backup”. This will
+              replace your current cadence data.
+            </Text>
+                        <TextInput
+              style={styles.backupTextArea}
+              multiline
+              value={backupImportText}
+              onChangeText={setBackupImportText}
+              placeholder="Paste backup JSON here to restore, or choose a file on web."
+            />
+            <View style={styles.backupButtonRow}>
+              <Pressable
+                style={styles.backupButton}
+                onPress={handleImportBackup}
+              >
+                <Text style={styles.backupButtonText}>Import backup</Text>
+              </Pressable>
+
+              {Platform.OS === 'web' && (
+                <Pressable
+                  style={[styles.backupButton, { marginLeft: 8 }]}
+                  onPress={handleImportBackupFileWeb}
+                >
+                  <Text style={styles.backupButtonText}>
+                    Choose backup file
+                  </Text>
+                </Pressable>
+              )}
+            </View>
+
+          </View>
+        )}
+
 
         {/* Tiny getting-started guide – only when no projects exist */}
         {projects.length === 0 && (
@@ -2926,6 +3197,52 @@ export default function App() {
 // ---- Styles ----
 
 const styles = StyleSheet.create({
+  
+    backupTextArea: {
+    marginTop: 4,
+    marginBottom: 8,
+    minHeight: 80,
+    maxHeight: 200,
+    borderWidth: 1,
+    borderColor: '#cfd8dc',
+    borderRadius: 6,
+    paddingHorizontal: 8,
+    paddingVertical: 6,
+    fontSize: 11,
+    backgroundColor: '#fafafa',
+    textAlignVertical: 'top',
+  },
+  backupButtonRow: {
+    flexDirection: 'row',
+    justifyContent: 'flex-start',
+    marginTop: 4,
+    marginBottom: 4,
+  },
+  backupButton: {
+    paddingVertical: 4,
+    paddingHorizontal: 10,
+    borderRadius: 999,
+    backgroundColor: '#e3f2fd',
+    borderWidth: 1,
+    borderColor: '#90caf9',
+  },
+  backupButtonText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#0d47a1',
+  },
+  backupErrorText: {
+    fontSize: 11,
+    color: '#c62828',
+    marginBottom: 4,
+  },
+  backupInfoText: {
+    fontSize: 11,
+    color: '#2e7d32',
+    marginBottom: 4,
+  },
+
+  
   debugPill: {
     paddingVertical: 4,
     paddingHorizontal: 8,
