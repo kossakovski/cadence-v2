@@ -551,7 +551,7 @@ const PPPHeaderRow: React.FC<PPPHeaderProps> = ({
   <View style={styles.pppHeaderRow}>
     {/* Object column */}
     <View style={[styles.pppHeaderCell, styles.pppObjectHeaderCell]}>
-      <Text style={styles.pppHeaderText}>Object</Text>
+      <Text style={styles.pppHeaderText}>Task / Owner</Text>
     </View>
 
     {/* Previous Plan */}
@@ -3510,11 +3510,15 @@ const styles = StyleSheet.create({
     color: '#333',
   },
   pppHeaderSubText: {
-    fontSize: 12,          // bigger
-    color: '#555',
-    marginTop: 2,
-    fontWeight: '500',
-  },
+  fontSize: 14,
+  fontWeight: '600',
+  color: '#333',
+  backgroundColor: '#f3f6fa',  // light, subtle tint
+  paddingHorizontal: 0,
+  borderRadius: 4,
+  marginTop: 2,
+},
+
 
     pppHeaderEditableTag: {
     fontSize: 10,
