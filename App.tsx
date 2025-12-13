@@ -7,6 +7,7 @@ import {
   TextInput,
   StyleSheet,
   Pressable,
+  Modal,
   Platform,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -200,6 +201,8 @@ function getCurrentCycle(node: CadenceNode): CadenceCycle {
   if (open) return open;
   return node.cycles[node.cycles.length - 1];
 }
+
+
 
 // ---- Date helpers ----
 
@@ -612,7 +615,8 @@ interface PPPRowProps {
   // Actions
   isReviewed?: boolean;
   onCompleteUpdate?: () => void;
-  onRetire?: () => void;
+  onRetire?: () => void; // legacy (button removed)
+  onOpenMenu?: () => void;
 }
 
 const PPPRow: React.FC<PPPRowProps> = ({
@@ -626,6 +630,7 @@ const PPPRow: React.FC<PPPRowProps> = ({
   isReviewed,
   onCompleteUpdate,
   onRetire,
+  onOpenMenu,
 }) => {
   const labelPrefix = getNodeLabelPrefix(node.kind);
   const baseLabel = `${labelPrefix}: ${node.name}`;
@@ -707,7 +712,7 @@ const PPPRow: React.FC<PPPRowProps> = ({
       </View>
 
       {/* Actions cell (optional) */}
-      {(onCompleteUpdate || onRetire) && (
+      {(onCompleteUpdate || onOpenMenu) && (
         <View style={styles.pppActionsCell}>
           {onCompleteUpdate && (
             <Pressable
@@ -728,12 +733,10 @@ const PPPRow: React.FC<PPPRowProps> = ({
               </Text>
             </Pressable>
           )}
-          {onRetire && (
-            <Pressable
-              style={styles.retireButton}
-              onPress={onRetire}
-            >
-              <Text style={styles.retireButtonText}>Retire</Text>
+
+          {onOpenMenu && (
+            <Pressable style={styles.kebabButton} onPress={onOpenMenu}>
+              <Text style={styles.kebabButtonText}>⋯</Text>
             </Pressable>
           )}
         </View>
@@ -762,6 +765,9 @@ interface ReviewSectionProps {
   reviewCycleOffset: number;
   onChangeReviewCycleOffset: (offset: number) => void;
   onCompletePeriodForScope: (taskIds: string[]) => void;
+
+  // Task menu
+  onOpenTaskMenu: (taskId: string) => void;
 }
 
 // Visible cycle helper: 0 = latest, 1 = previous, etc.
@@ -801,6 +807,7 @@ const ReviewSection: React.FC<ReviewSectionProps> = ({
   reviewCycleOffset,
   onChangeReviewCycleOffset,
   onCompletePeriodForScope,
+  onOpenTaskMenu,
 }) => {
   const projects = getProjects(nodes);
   if (projects.length === 0) {
@@ -1094,7 +1101,7 @@ const ReviewSection: React.FC<ReviewSectionProps> = ({
                 ? () => onCompleteUpdateForNode(node.id)
                 : undefined
             }
-            onRetire={showActions ? () => onRetireNode(node.id) : undefined}
+            onOpenMenu={showActions ? () => onOpenTaskMenu(node.id) : undefined}
           />
         );
       })}
@@ -1296,6 +1303,8 @@ interface OpenModeSectionProps {
   onUpdateOwner: (nodeId: string, value: string) => void;
   onCompleteUpdateForNode: (nodeId: string) => void;
   onRetireNode: (nodeId: string) => void;
+  // Task menu
+  onOpenTaskMenu: (taskId: string) => void;
 }
 
 const OpenModeSection: React.FC<OpenModeSectionProps> = ({
@@ -1304,6 +1313,7 @@ const OpenModeSection: React.FC<OpenModeSectionProps> = ({
   onUpdateOwner,
   onCompleteUpdateForNode,
   onRetireNode,
+  onOpenTaskMenu,
 }) => {
   const dueLabel = (state: DueState): string =>
     state === 'overdue'
@@ -1357,7 +1367,7 @@ const OpenModeSection: React.FC<OpenModeSectionProps> = ({
             statusLabel={statusLabel}
             isReviewed={!!cycle.reviewed}
             onCompleteUpdate={() => onCompleteUpdateForNode(node.id)}
-            onRetire={() => onRetireNode(node.id)}
+            onOpenMenu={() => onOpenTaskMenu(node.id)}
           />
         );
       })}
@@ -1474,6 +1484,29 @@ export default function App() {
   const [backupImportText, setBackupImportText] = useState('');
   const [backupError, setBackupError] = useState<string | null>(null);
   const [backupInfo, setBackupInfo] = useState<string | null>(null);
+
+  // Task actions (kebab menu / modal)
+  const [taskMenuTaskId, setTaskMenuTaskId] = useState<string | null>(null);
+  const [taskMenuDraftName, setTaskMenuDraftName] = useState('');
+  const [taskMenuDraftCadence, setTaskMenuDraftCadence] =
+    useState<CadenceType>('weekly');
+
+  // ---- Task menu helpers ----
+  function onOpenTaskMenu(taskId: string) {
+    const node = state.nodes.find((n) => n.id === taskId && n.kind === 'task');
+    if (!node) return;
+    setTaskMenuTaskId(taskId);
+    setTaskMenuDraftName(node.name || '');
+    setTaskMenuDraftCadence((node as any).cadence || 'weekly');
+  }
+
+  function closeTaskMenu() {
+    setTaskMenuTaskId(null);
+  }
+
+
+  // Inactive tasks list toggle (per-scope section)
+  const [showInactiveTasks, setShowInactiveTasks] = useState(false);
 
   // Create-new local UI state
   const [isCreatingProject, setIsCreatingProject] = useState(false);
@@ -1616,13 +1649,19 @@ export default function App() {
     : getAllWorkstreams(state.nodes);
 
   // Tasks visibility:
-  const tasks = inOwnersMode
-    ? state.nodes.filter((n) => n.kind === 'task' && !n.retired)
+  const allScopeTasks = inOwnersMode
+    ? state.nodes.filter((n) => n.kind === 'task')
     : state.activeWorkstreamId
     ? getTasksForWorkstream(state.nodes, state.activeWorkstreamId)
     : state.activeProjectId
     ? getTasksForProject(state.nodes, state.activeProjectId)
-    : state.nodes.filter((n) => n.kind === 'task' && !n.retired);
+    : state.nodes.filter((n) => n.kind === 'task');
+
+  const tasks = allScopeTasks.filter((t) => !t.retired);
+  const inactiveTasks = allScopeTasks.filter((t) => !!t.retired);
+
+  const taskMenuNode =
+    taskMenuTaskId ? state.nodes.find((n) => n.id === taskMenuTaskId) : null;
 
   const ownerSummaries = getOwnerSummaries(state.nodes);
   const activeOwnerSummary = ownerSummaries.find(
@@ -1825,6 +1864,66 @@ export default function App() {
       if (next.activeProjectId === nodeId) next.activeProjectId = undefined;
 
       return next;
+    });
+  };
+
+
+  const handleRenameTask = (taskId: string, nextName: string) => {
+    const name = nextName.trim();
+    if (!name) return;
+    setState((prev) => {
+      if (!prev) return prev;
+      const updatedNodes = prev.nodes.map((n) =>
+        n.id === taskId ? { ...n, name } : n
+      );
+      return { ...prev, nodes: updatedNodes };
+    });
+  };
+
+  // Cadence changes apply starting NEXT cycle (Option A)
+  const handleSetTaskCadence = (taskId: string, cadence: CadenceType) => {
+    setState((prev) => {
+      if (!prev) return prev;
+      const updatedNodes = prev.nodes.map((n) =>
+        n.id === taskId ? { ...n, cadence } : n
+      );
+      return { ...prev, nodes: updatedNodes };
+    });
+  };
+
+  const handleActivateTask = (taskId: string) => {
+    setState((prev) => {
+      if (!prev) return prev;
+      const nowStr = formatISODate(new Date());
+
+      const updatedNodes = prev.nodes.map((n) => {
+        if (n.id !== taskId) return n;
+        if (!n.retired) return n;
+
+        const cycles = n.cycles || [];
+        const last = cycles.length > 0 ? cycles[cycles.length - 1] : undefined;
+        const nextIndex = last ? (last.index ?? cycles.length - 1) + 1 : 0;
+
+        const newCycle: CadenceCycle = {
+          id: `${n.id}-period-${nextIndex + 1}`,
+          index: nextIndex,
+          status: 'open',
+          startDate: nowStr,
+          previousPlan: last?.nextPlan || '',
+          actuals: '',
+          nextPlan: '',
+          owner: last?.owner || '',
+          reviewed: false,
+        };
+
+        return {
+          ...n,
+          retired: false,
+          cycles: [...cycles, newCycle],
+        };
+      });
+
+      return { ...prev, nodes: updatedNodes, activeTaskId: taskId };
     });
   };
 
@@ -3060,7 +3159,36 @@ export default function App() {
             })
           )}
 
-          {/* Add Task pill (requires active workstream) */}
+          
+          {/* Inactive tasks (collapsible) */}
+          {state.viewMode !== 'owners' && inactiveTasks.length > 0 && (
+            <View style={styles.inactiveTasksBlock}>
+              <Pressable
+                style={styles.inactiveTasksToggle}
+                onPress={() => setShowInactiveTasks((p) => !p)}
+              >
+                <Text style={styles.inactiveTasksToggleText}>
+                  Inactive tasks ({inactiveTasks.length}) {showInactiveTasks ? '▾' : '▸'}
+                </Text>
+              </Pressable>
+
+              {showInactiveTasks && (
+                <View style={styles.inactiveTasksPillRow}>
+                  {inactiveTasks.map((t) => (
+                    <Pressable
+                      key={t.id}
+                      style={styles.inactiveTaskPill}
+                      onPress={() => handleActivateTask(t.id)}
+                    >
+                      <Text style={styles.inactiveTaskPillText}>{t.name}</Text>
+                    </Pressable>
+                  ))}
+                </View>
+              )}
+            </View>
+          )}
+
+{/* Add Task pill (requires active workstream) */}
           {state.viewMode !== 'owners' && (
             <Pressable
               style={[
@@ -3173,6 +3301,7 @@ export default function App() {
             reviewCycleOffset={reviewCycleOffset}
             onChangeReviewCycleOffset={setReviewCycleOffset}
             onCompletePeriodForScope={handleCompletePeriodForScope}
+            onOpenTaskMenu={onOpenTaskMenu}
           />
         ) : state.viewMode === 'owners' ? (
           <OwnersOverviewSection
@@ -3187,9 +3316,106 @@ export default function App() {
             onUpdateOwner={handleUpdateNodeOwner}
             onCompleteUpdateForNode={handleCompleteUpdateForNode}
             onRetireNode={handleRetireNode}
+            onOpenTaskMenu={onOpenTaskMenu}
           />
         )}
       </ScrollView>
+
+      {/* Task actions modal */}
+      <Modal
+        transparent
+        visible={!!taskMenuTaskId && !!taskMenuNode}
+        animationType="fade"
+        onRequestClose={closeTaskMenu}
+      >
+        <Pressable style={styles.modalOverlay} onPress={closeTaskMenu}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Task</Text>
+
+            <Text style={styles.modalLabel}>Name</Text>
+            <TextInput
+              style={styles.modalTextInput}
+              value={taskMenuDraftName}
+              onChangeText={setTaskMenuDraftName}
+              placeholder="Task name"
+            />
+
+            <Text style={styles.modalLabel}>Cadence</Text>
+            <Text style={styles.modalHelper}>
+              Changes apply starting next cycle.
+            </Text>
+            <View style={styles.modalChipRow}>
+              {(
+                ['daily', 'weekly', 'biweekly', 'monthly', 'quarterly'] as CadenceType[]
+              ).map((c) => (
+                <Pressable
+                  key={c}
+                  style={[
+                    styles.modalChip,
+                    taskMenuDraftCadence === c && styles.modalChipActive,
+                  ]}
+                  onPress={() => setTaskMenuDraftCadence(c)}
+                >
+                  <Text
+                    style={[
+                      styles.modalChipText,
+                      taskMenuDraftCadence === c && styles.modalChipTextActive,
+                    ]}
+                  >
+                    {c}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+
+            <View style={styles.modalButtonRow}>
+              <Pressable
+                style={styles.modalPrimaryButton}
+                onPress={() => {
+                  if (!taskMenuNode) return;
+                  handleRenameTask(taskMenuNode.id, taskMenuDraftName);
+                  handleSetTaskCadence(taskMenuNode.id, taskMenuDraftCadence);
+                  closeTaskMenu();
+                }}
+              >
+                <Text style={styles.modalPrimaryButtonText}>Save</Text>
+              </Pressable>
+
+              {taskMenuNode?.retired ? (
+                <Pressable
+                  style={styles.modalSecondaryButton}
+                  onPress={() => {
+                    if (!taskMenuNode) return;
+                    handleActivateTask(taskMenuNode.id);
+                    closeTaskMenu();
+                  }}
+                >
+                  <Text style={styles.modalSecondaryButtonText}>Activate</Text>
+                </Pressable>
+              ) : (
+                <Pressable
+                  style={styles.modalDangerButton}
+                  onPress={() => {
+                    if (!taskMenuNode) return;
+                    handleRetireNode(taskMenuNode.id);
+                    closeTaskMenu();
+                  }}
+                >
+                  <Text style={styles.modalDangerButtonText}>Retire</Text>
+                </Pressable>
+              )}
+
+              <Pressable
+                style={styles.modalCancelButton}
+                onPress={closeTaskMenu}
+              >
+                <Text style={styles.modalCancelButtonText}>Cancel</Text>
+              </Pressable>
+            </View>
+          </View>
+        </Pressable>
+      </Modal>
+
     </SafeAreaView>
   );
 }
@@ -3861,4 +4087,185 @@ const styles = StyleSheet.create({
     fontSize: 11,
     color: '#1976d2',
   },
+
+  // Inactive tasks UI
+  inactiveTasksBlock: {
+    marginLeft: 6,
+    marginTop: 6,
+  },
+  inactiveTasksToggle: {
+    paddingVertical: 4,
+    paddingHorizontal: 8,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#cfd8dc',
+    backgroundColor: '#f5f5f5',
+    alignSelf: 'flex-start',
+  },
+  inactiveTasksToggleText: {
+    fontSize: 12,
+    color: '#455a64',
+    fontWeight: '600',
+  },
+  inactiveTasksPillRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    marginTop: 6,
+    gap: 6,
+  },
+  inactiveTaskPill: {
+    paddingVertical: 4,
+    paddingHorizontal: 8,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#b0bec5',
+    backgroundColor: '#eeeeee',
+  },
+  inactiveTaskPillText: {
+    fontSize: 12,
+    color: '#455a64',
+  },
+
+  // Kebab menu button
+  kebabButton: {
+    marginTop: 6,
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#cfd8dc',
+    backgroundColor: '#fafafa',
+  },
+  kebabButtonText: {
+    fontSize: 18,
+    fontWeight: '800',
+    color: '#455a64',
+    lineHeight: 18,
+  },
+
+  // Modal
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.25)',
+    justifyContent: 'center',
+    padding: 16,
+  },
+  modalCard: {
+    backgroundColor: '#fff',
+    borderRadius: 12,
+    padding: 12,
+    borderWidth: 1,
+    borderColor: '#e0e0e0',
+  },
+  modalTitle: {
+    fontSize: 16,
+    fontWeight: '800',
+    marginBottom: 8,
+  },
+  modalLabel: {
+    fontSize: 12,
+    fontWeight: '700',
+    marginTop: 8,
+    marginBottom: 4,
+    color: '#333',
+  },
+  modalHelper: {
+    fontSize: 11,
+    color: '#666',
+    marginBottom: 6,
+  },
+  modalTextInput: {
+    borderWidth: 1,
+    borderColor: '#cfd8dc',
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    fontSize: 13,
+    backgroundColor: '#fafafa',
+  },
+  modalChipRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+    marginTop: 2,
+  },
+  modalChip: {
+    paddingVertical: 4,
+    paddingHorizontal: 8,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#cfd8dc',
+    backgroundColor: '#f5f5f5',
+  },
+  modalChipActive: {
+    borderColor: '#81c784',
+    backgroundColor: '#c8e6c9',
+  },
+  modalChipText: {
+    fontSize: 12,
+    color: '#333',
+  },
+  modalChipTextActive: {
+    color: '#1b5e20',
+    fontWeight: '700',
+  },
+  modalButtonRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginTop: 12,
+  },
+  modalPrimaryButton: {
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+    backgroundColor: '#e3f2fd',
+    borderWidth: 1,
+    borderColor: '#90caf9',
+  },
+  modalPrimaryButtonText: {
+    fontSize: 12,
+    fontWeight: '800',
+    color: '#0d47a1',
+  },
+  modalSecondaryButton: {
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+    backgroundColor: '#e8f5e9',
+    borderWidth: 1,
+    borderColor: '#81c784',
+  },
+  modalSecondaryButtonText: {
+    fontSize: 12,
+    fontWeight: '800',
+    color: '#1b5e20',
+  },
+  modalDangerButton: {
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+    backgroundColor: '#ffebee',
+    borderWidth: 1,
+    borderColor: '#ef9a9a',
+  },
+  modalDangerButtonText: {
+    fontSize: 12,
+    fontWeight: '800',
+    color: '#b71c1c',
+  },
+  modalCancelButton: {
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+    backgroundColor: '#eeeeee',
+    borderWidth: 1,
+    borderColor: '#cfd8dc',
+  },
+  modalCancelButtonText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#455a64',
+  },
+
 });
