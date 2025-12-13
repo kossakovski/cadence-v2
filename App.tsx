@@ -43,6 +43,7 @@ interface CadenceNode {
   parentId?: string; // undefined for top-level projects
   name: string;
   cadence: CadenceType;
+  pendingCadence?: CadenceType; // workstream-level cadence change, effective next cycle
   cycles: CadenceCycle[]; // for MVP, cadence table is meaningful only for tasks
   retired?: boolean;
 
@@ -413,7 +414,27 @@ function closeCurrentCycle(node: CadenceNode): CadenceNode {
   };
 }
 
+
+
 // ---- Cadence helpers ----
+
+function getCadenceReviewTitle(cadence: CadenceType): string {
+  switch (cadence) {
+    case 'daily':
+      return 'Daily Review';
+    case 'weekly':
+      return 'Weekly Review';
+    case 'biweekly':
+      return 'Biweekly Review';
+    case 'monthly':
+      return 'Monthly Review';
+    case 'quarterly':
+      return 'Quarterly Review';
+    default:
+      return 'Cadence Review';
+  }
+}
+
 
 function getCadenceLabel(cadence: CadenceType): string {
   switch (cadence) {
@@ -553,9 +574,8 @@ const PPPHeaderRow: React.FC<PPPHeaderProps> = ({
 }) => (
   <View style={styles.pppHeaderRow}>
     {/* Object column */}
-    <View style={[styles.pppHeaderCell, styles.pppObjectHeaderCell]}>
-      <Text style={styles.pppHeaderText}>Task / Owner</Text>
-    </View>
+    <View style={[styles.pppHeaderCell, styles.pppObjectHeaderCell]} />
+
 
     {/* Previous Plan */}
     <View style={styles.pppHeaderCell}>
@@ -662,7 +682,7 @@ const PPPRow: React.FC<PPPRowProps> = ({
         </Text>
         {canEditOwner ? (
           <TextInput
-            style={styles.ownerInlineInput}
+            style={[styles.ownerInlineInput, styles.editableOutlineInput]}
             value={cycle.owner}
             onChangeText={onUpdateOwner}
             placeholder="Owner?"
@@ -680,7 +700,7 @@ const PPPRow: React.FC<PPPRowProps> = ({
       </View>
 
       {/* Actuals */}
-      <View style={[styles.pppCell, styles.fieldInputCurrentActuals]}>
+      <View style={[styles.pppCell, styles.fieldInputCurrentActuals, canEdit && styles.editableOutline]}>
         {canEdit ? (
           <TextInput
             style={styles.pppTextInput}
@@ -696,7 +716,7 @@ const PPPRow: React.FC<PPPRowProps> = ({
       </View>
 
       {/* Next Plan */}
-      <View style={[styles.pppCell, styles.fieldInputCurrentNext]}>
+      <View style={[styles.pppCell, styles.fieldInputCurrentNext, canEdit && styles.editableOutline]}>
         {canEdit ? (
           <TextInput
             style={styles.pppTextInput}
@@ -810,10 +830,29 @@ const ReviewSection: React.FC<ReviewSectionProps> = ({
   onOpenTaskMenu,
 }) => {
   const projects = getProjects(nodes);
+  const activeWs = nodes.find(
+    (n) => n.id === activeWorkstreamId && n.kind === 'workstream' && !n.retired
+  );
+  const reviewTitle = getCadenceReviewTitle(
+  activeWs?.cadence || 'weekly'
+);
+
+if (!activeWs) {
+  return (
+    <View style={styles.section}>
+      <Text style={styles.sectionTitle}>Review</Text>
+      <Text style={styles.cycleMetaSmall}>
+        Select a workstream to review.
+      </Text>
+    </View>
+  );
+}
+
+
   if (projects.length === 0) {
     return (
       <View style={styles.section}>
-        <Text style={styles.sectionTitle}>Cadence Review</Text>
+        <Text style={styles.sectionTitle}>{reviewTitle}</Text>
         <Text style={styles.cycleMetaSmall}>
           No projects defined yet.
         </Text>
@@ -890,7 +929,7 @@ const ReviewSection: React.FC<ReviewSectionProps> = ({
   if (rows.length === 0) {
     return (
       <View style={styles.section}>
-        <Text style={styles.sectionTitle}>Cadence Review</Text>
+        <Text style={styles.sectionTitle}>{reviewTitle}</Text>
         <Text style={styles.cycleMetaSmall}>
           Nothing to review for current selection.
         </Text>
@@ -993,7 +1032,15 @@ const ReviewSection: React.FC<ReviewSectionProps> = ({
 
   return (
     <View style={styles.section}>
-      <Text style={styles.sectionTitle}>Cadence Review</Text>
+      <Text style={styles.sectionTitle}>{reviewTitle}</Text>
+      <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 4 }}>
+  <View style={[styles.selectorPill, styles.selectorPillActive]}>
+    <Text style={[styles.selectorPillText, styles.selectorPillTextActive]}>
+      {activeWs.name}
+    </Text>
+  </View>
+</View>
+
       <Text style={styles.cycleMetaSmall}>
         Scope: {scopeLabel || 'All'}
       </Text>
@@ -1066,7 +1113,7 @@ const ReviewSection: React.FC<ReviewSectionProps> = ({
     previousLocked={true}
     actualEditable={isCurrentPeriod}
     nextEditable={isCurrentPeriod}
-    showActions
+    showActions={isCurrentPeriod}
   />
 
 
@@ -1078,7 +1125,7 @@ const ReviewSection: React.FC<ReviewSectionProps> = ({
           cycle.status === 'open' &&
           reviewCycleOffset === 0;
 
-        const showActions = node.kind === 'task';
+        const showActions = editable;
 
         return (
           <PPPRow
@@ -1245,8 +1292,10 @@ const OwnersOverviewSection: React.FC<OwnersOverviewSectionProps> = ({
 
   return (
     <View style={styles.section}>
-      <Text style={styles.sectionTitle}>Owner Overview</Text>
-      <Text style={styles.cycleMetaSmall}>Owner: {summary.owner}</Text>
+      <Text style={styles.sectionTitle}>
+  Tasks owned by {summary.owner}
+</Text>
+
 
       {visibleEntries.length === 0 ? (
         <Text style={styles.cycleMetaSmall}>
@@ -1488,7 +1537,10 @@ export default function App() {
   // Task actions (kebab menu / modal)
   const [taskMenuTaskId, setTaskMenuTaskId] = useState<string | null>(null);
   const [taskMenuDraftName, setTaskMenuDraftName] = useState('');
-  const [taskMenuDraftCadence, setTaskMenuDraftCadence] =
+
+  // Workstream actions (header kebab / modal)
+  const [workstreamMenuWsId, setWorkstreamMenuWsId] = useState<string | null>(null);
+  const [workstreamMenuDraftCadence, setWorkstreamMenuDraftCadence] =
     useState<CadenceType>('weekly');
 
   // ---- Task menu helpers ----
@@ -1497,11 +1549,22 @@ export default function App() {
     if (!node) return;
     setTaskMenuTaskId(taskId);
     setTaskMenuDraftName(node.name || '');
-    setTaskMenuDraftCadence((node as any).cadence || 'weekly');
-  }
+      }
 
   function closeTaskMenu() {
     setTaskMenuTaskId(null);
+  }
+
+  function onOpenWorkstreamMenu(workstreamId: string) {
+    const ws = state.nodes.find((n) => n.id === workstreamId && n.kind === 'workstream');
+    if (!ws) return;
+    setWorkstreamMenuWsId(workstreamId);
+    // default to current cadence, but if a pending cadence exists, show that as the selection
+    setWorkstreamMenuDraftCadence((ws.pendingCadence as any) || ws.cadence || 'weekly');
+  }
+
+  function closeWorkstreamMenu() {
+    setWorkstreamMenuWsId(null);
   }
 
 
@@ -1514,12 +1577,12 @@ export default function App() {
 
   const [isCreatingWorkstream, setIsCreatingWorkstream] = useState(false);
   const [newWorkstreamName, setNewWorkstreamName] = useState('');
+  const [newWorkstreamCadence, setNewWorkstreamCadence] =
+    useState<CadenceType>('weekly');
 
   const [isCreatingTask, setIsCreatingTask] = useState(false);
   const [newTaskName, setNewTaskName] = useState('');
   const [newTaskOwner, setNewTaskOwner] = useState('');
-  const [newTaskCadence, setNewTaskCadence] =
-    useState<CadenceType>('weekly');
   const [milestonePickerWsId, setMilestonePickerWsId] = useState<string | null>(null);
   const [milestonePickerDate, setMilestonePickerDate] = useState<Date | null>(null);
 
@@ -1662,6 +1725,9 @@ export default function App() {
 
   const taskMenuNode =
     taskMenuTaskId ? state.nodes.find((n) => n.id === taskMenuTaskId) : null;
+
+  const workstreamMenuNode =
+    workstreamMenuWsId ? state.nodes.find((n) => n.id === workstreamMenuWsId) : null;
 
   const ownerSummaries = getOwnerSummaries(state.nodes);
   const activeOwnerSummary = ownerSummaries.find(
@@ -1880,16 +1946,19 @@ export default function App() {
     });
   };
 
-  // Cadence changes apply starting NEXT cycle (Option A)
-  const handleSetTaskCadence = (taskId: string, cadence: CadenceType) => {
+  const handleSetWorkstreamPendingCadence = (workstreamId: string, cadence: CadenceType) => {
     setState((prev) => {
       if (!prev) return prev;
-      const updatedNodes = prev.nodes.map((n) =>
-        n.id === taskId ? { ...n, cadence } : n
-      );
+      const updatedNodes = prev.nodes.map((n) => {
+        if (n.id !== workstreamId || n.kind !== 'workstream') return n;
+        // forward-looking: store as pending until next cycle creation
+        return { ...n, pendingCadence: cadence };
+      });
       return { ...prev, nodes: updatedNodes };
     });
   };
+
+
 
   const handleActivateTask = (taskId: string) => {
     setState((prev) => {
@@ -1932,16 +2001,52 @@ export default function App() {
     const idSet = new Set(taskIds);
     setState((prev) => {
       if (!prev) return prev;
+
+      // Map: workstreamId -> pendingCadence (if any)
+      const pendingByWs = new Map<string, CadenceType>();
+      prev.nodes.forEach((n) => {
+        if (n.kind === 'workstream' && n.pendingCadence) {
+          pendingByWs.set(n.id, n.pendingCadence);
+        }
+      });
+
+      // Track which workstreams are impacted in this completion
+      const touchedWs = new Set<string>();
+
       const updatedNodes = prev.nodes.map((n) => {
         if (!idSet.has(n.id)) return n;
-        if (!n.cycles || n.cycles.length === 0) return n;
-        const current = getCurrentCycle(n);
-        if (current.status !== 'open') return n;
-        return closeCurrentCycle(n);
+
+        // Tasks: close current cycle; if parent workstream has pending cadence,
+        // apply it now so it takes effect starting the *next* cycle.
+        if (n.kind === 'task') {
+          if (!n.cycles || n.cycles.length === 0) return n;
+          const current = getCurrentCycle(n);
+          if (current.status !== 'open') return n;
+
+          const parentWsId = n.parentId;
+          const pending = parentWsId ? pendingByWs.get(parentWsId) : undefined;
+          if (parentWsId) touchedWs.add(parentWsId);
+
+          const withCadenceApplied = pending ? { ...n, cadence: pending } : n;
+          return closeCurrentCycle(withCadenceApplied);
+        }
+
+        return n;
       });
-      return { ...prev, nodes: updatedNodes };
+
+      // If a workstream has a pending cadence AND we just completed a period for tasks under it,
+      // promote pendingCadence -> cadence and clear pendingCadence (forward-looking change becomes current).
+      const finalNodes = updatedNodes.map((n) => {
+        if (n.kind !== 'workstream') return n;
+        if (!touchedWs.has(n.id)) return n;
+        if (!n.pendingCadence) return n;
+        return { ...n, cadence: n.pendingCadence, pendingCadence: undefined };
+      });
+
+      return { ...prev, nodes: finalNodes };
     });
   };
+
 
   const handleSelectProject = (projectId: string) => {
     setReviewCycleOffset(0);
@@ -2386,6 +2491,12 @@ export default function App() {
       n.id === state.activeProjectId && n.kind === 'project' && !n.retired
   );
 
+ const reviewTitle = currentWs
+  ? getCadenceReviewTitle(currentWs.cadence)
+  : 'Review';
+
+
+
   // Advanced toggle handler
   const toggleAdvanced = () => {
     setShowAdvanced((prevShow) => {
@@ -2436,7 +2547,7 @@ export default function App() {
       kind: 'workstream',
       parentId: state.activeProjectId,
       name,
-      cadence: 'weekly',
+      cadence: newWorkstreamCadence,
       cycles: [],
     };
 
@@ -2448,6 +2559,7 @@ export default function App() {
     });
     setIsCreatingWorkstream(false);
     setNewWorkstreamName('');
+    setNewWorkstreamCadence('weekly');
   };
 
   const handleCreateTask = () => {
@@ -2471,12 +2583,17 @@ export default function App() {
       owner: newTaskOwner.trim(),
       reviewed: false,
     };
+    const parentWs = state.nodes.find(
+      (n) => n.id === state.activeWorkstreamId && n.kind === 'workstream'
+    );
+
     const newNode: CadenceNode = {
       id: newId,
       kind: 'task',
       parentId: state.activeWorkstreamId,
       name,
-      cadence: newTaskCadence,
+      // Tasks inherit cadence from their workstream (Option A)
+      cadence: (parentWs?.cadence as any) || 'weekly',
       cycles: [newCycle],
     };
 
@@ -2488,7 +2605,6 @@ export default function App() {
     setIsCreatingTask(false);
     setNewTaskName('');
     setNewTaskOwner('');
-    setNewTaskCadence('weekly');
   };
 
   return (
@@ -2500,7 +2616,7 @@ export default function App() {
         {/* Mode toggle + Help + Advanced */}
         <View style={styles.modeRow}>
           <ModePill
-            label="Cadence Review"
+            label={reviewTitle}
             active={state.viewMode === 'review'}
             onPress={() => handleSetViewMode('review')}
           />
@@ -2553,7 +2669,7 @@ export default function App() {
               {'\n'}
               {'   '}• Create a <Text style={{ fontWeight: '600' }}>project</Text> (e.g. “North Star program”).{'\n'}
               {'   '}• Under a project, create one or more <Text style={{ fontWeight: '600' }}>workstreams</Text>.{'\n'}
-              {'   '}• Under each workstream, create <Text style={{ fontWeight: '600' }}>tasks</Text> with owners and cadence.
+              {'   '}• Under each workstream, create <Text style={{ fontWeight: '600' }}>tasks</Text> with owners.
             </Text>
             <Text style={styles.cycleMetaSmall}>
               2. <Text style={{ fontWeight: '600' }}>During the period</Text> (week / month, etc.) update:{'\n'}
@@ -2562,7 +2678,7 @@ export default function App() {
             </Text>
             <Text style={styles.cycleMetaSmall}>
               3. <Text style={{ fontWeight: '600' }}>Cadence Review ritual.</Text>{'\n'}
-              {'   '}• Use the <Text style={{ fontWeight: '600' }}>Cadence Review</Text> tab once per period.{'\n'}
+              {'   '}• Use the <Text style={{ fontWeight: '600' }}>{reviewTitle} Review</Text> tab once per period.{'\n'}
               {'   '}• Choose scope via the <Text style={{ fontWeight: '600' }}>project / workstream / task</Text> pills.{'\n'}
               {'   '}• For the current period, review each task and click{' '}
               <Text style={{ fontWeight: '600' }}>“Complete Update”</Text> when its Actuals and Next Plan are done.{'\n'}
@@ -2942,13 +3058,7 @@ export default function App() {
           </Text>
         </Text>
         <View style={styles.pillRow}>
-          {inReviewMode && (
-            <SelectorPill
-              label="ALL"
-              active={!state.activeWorkstreamId}
-              onPress={clearWorkstreamSelection}
-            />
-          )}
+          
           {workstreams.length === 0 ? (
             <Text style={styles.cycleMetaSmall}>
               No workstreams yet.
@@ -3010,6 +3120,34 @@ export default function App() {
               value={newWorkstreamName}
               onChangeText={setNewWorkstreamName}
             />
+
+            <View style={styles.cadencePickerRow}>
+              <Text style={styles.cadencePickerLabel}>Cadence:</Text>
+              <View style={styles.cadenceChipRow}>
+                {(
+                  ['daily', 'weekly', 'biweekly', 'monthly', 'quarterly'] as CadenceType[]
+                ).map((c) => (
+                  <Pressable
+                    key={c}
+                    onPress={() => setNewWorkstreamCadence(c)}
+                    style={[
+                      styles.cadenceChip,
+                      newWorkstreamCadence === c && styles.cadenceChipActive,
+                    ]}
+                  >
+                    <Text
+                      style={[
+                        styles.cadenceChipText,
+                        newWorkstreamCadence === c && styles.cadenceChipTextActive,
+                      ]}
+                    >
+                      {getCadenceLabel(c)}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
+            </View>
+
             <View style={styles.createActionsRow}>
               <Pressable
                 style={styles.createActionPill}
@@ -3022,6 +3160,7 @@ export default function App() {
                 onPress={() => {
                   setIsCreatingWorkstream(false);
                   setNewWorkstreamName('');
+                  setNewWorkstreamCadence('weekly');
                 }}
               >
                 <Text style={styles.createActionPillSecondaryText}>
@@ -3031,6 +3170,7 @@ export default function App() {
             </View>
           </View>
         )}
+
 
         {/* Workstream milestones section */}
 {state.showWorkstreamMilestones && workstreams.length > 0 && (
@@ -3222,36 +3362,9 @@ export default function App() {
               value={newTaskOwner}
               onChangeText={setNewTaskOwner}
             />
-            <View style={styles.cadencePickerRow}>
-              <Text style={styles.cadencePickerLabel}>Cadence:</Text>
-              {(
-                [
-                  'daily',
-                  'weekly',
-                  'biweekly',
-                  'monthly',
-                  'quarterly',
-                ] as CadenceType[]
-              ).map((c) => (
-                <Pressable
-                  key={c}
-                  style={[
-                    styles.cadenceChip,
-                    newTaskCadence === c && styles.cadenceChipActive,
-                  ]}
-                  onPress={() => setNewTaskCadence(c)}
-                >
-                  <Text
-                    style={[
-                      styles.cadenceChipText,
-                      newTaskCadence === c && styles.cadenceChipTextActive,
-                    ]}
-                  >
-                    {c}
-                  </Text>
-                </Pressable>
-              ))}
-            </View>
+            <Text style={styles.createHelperText}>
+              Cadence is inherited from the selected workstream.
+            </Text>
             <View style={styles.createActionsRow}>
               <Pressable
                 style={styles.createActionPill}
@@ -3265,7 +3378,6 @@ export default function App() {
                   setIsCreatingTask(false);
                   setNewTaskName('');
                   setNewTaskOwner('');
-                  setNewTaskCadence('weekly');
                 }}
               >
                 <Text style={styles.createActionPillSecondaryText}>
@@ -3276,15 +3388,31 @@ export default function App() {
           </View>
         )}
 
+
         {/* Active context line (Review only) */}
         {state.viewMode === 'review' &&
           currentTask &&
           currentWs &&
           currentProj && (
-            <Text style={styles.nodeSubtitle}>
-              Project: {currentProj.name} · Workstream: {currentWs.name} ·
-              cadence: {currentWs.cadence}
-            </Text>
+            <View style={styles.activeContextRow}>
+              <Text style={styles.nodeSubtitle}>
+                Project: {currentProj.name} · Workstream: {currentWs.name} · Cadence:{' '}
+                {getCadenceLabel(currentWs.cadence)}
+                {currentWs.pendingCadence
+                  ? ` (next: ${getCadenceLabel(currentWs.pendingCadence)})`
+                  : ''}
+              </Text>
+
+              {/* Workstream kebab: current cycle only */}
+              {reviewCycleOffset === 0 && (
+                <Pressable
+                  style={styles.kebabButtonSmall}
+                  onPress={() => onOpenWorkstreamMenu(currentWs.id)}
+                >
+                  <Text style={styles.kebabButtonText}>⋯</Text>
+                </Pressable>
+              )}
+            </View>
           )}
 
         {/* Main content */}
@@ -3340,33 +3468,6 @@ export default function App() {
               placeholder="Task name"
             />
 
-            <Text style={styles.modalLabel}>Cadence</Text>
-            <Text style={styles.modalHelper}>
-              Changes apply starting next cycle.
-            </Text>
-            <View style={styles.modalChipRow}>
-              {(
-                ['daily', 'weekly', 'biweekly', 'monthly', 'quarterly'] as CadenceType[]
-              ).map((c) => (
-                <Pressable
-                  key={c}
-                  style={[
-                    styles.modalChip,
-                    taskMenuDraftCadence === c && styles.modalChipActive,
-                  ]}
-                  onPress={() => setTaskMenuDraftCadence(c)}
-                >
-                  <Text
-                    style={[
-                      styles.modalChipText,
-                      taskMenuDraftCadence === c && styles.modalChipTextActive,
-                    ]}
-                  >
-                    {c}
-                  </Text>
-                </Pressable>
-              ))}
-            </View>
 
             <View style={styles.modalButtonRow}>
               <Pressable
@@ -3374,7 +3475,6 @@ export default function App() {
                 onPress={() => {
                   if (!taskMenuNode) return;
                   handleRenameTask(taskMenuNode.id, taskMenuDraftName);
-                  handleSetTaskCadence(taskMenuNode.id, taskMenuDraftCadence);
                   closeTaskMenu();
                 }}
               >
@@ -3415,6 +3515,73 @@ export default function App() {
           </View>
         </Pressable>
       </Modal>
+
+      {/* Workstream actions modal */}
+      <Modal
+        transparent
+        visible={!!workstreamMenuWsId && !!workstreamMenuNode}
+        animationType="fade"
+        onRequestClose={closeWorkstreamMenu}
+      >
+        <Pressable style={styles.modalOverlay} onPress={closeWorkstreamMenu}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Workstream</Text>
+
+            <Text style={styles.modalLabel}>Cadence (effective next cycle)</Text>
+            <Text style={styles.modalHelper}>
+              This will take effect when you complete the current period update.
+            </Text>
+
+            <View style={styles.modalChipRow}>
+              {(
+                ['daily', 'weekly', 'biweekly', 'monthly', 'quarterly'] as CadenceType[]
+              ).map((c) => (
+                <Pressable
+                  key={c}
+                  style={[
+                    styles.modalChip,
+                    workstreamMenuDraftCadence === c && styles.modalChipActive,
+                  ]}
+                  onPress={() => setWorkstreamMenuDraftCadence(c)}
+                >
+                  <Text
+                    style={[
+                      styles.modalChipText,
+                      workstreamMenuDraftCadence === c && styles.modalChipTextActive,
+                    ]}
+                  >
+                    {getCadenceLabel(c)}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+
+            <View style={styles.modalButtonRow}>
+              <Pressable
+                style={styles.modalPrimaryButton}
+                onPress={() => {
+                  if (!workstreamMenuNode) return;
+                  handleSetWorkstreamPendingCadence(
+                    workstreamMenuNode.id,
+                    workstreamMenuDraftCadence
+                  );
+                  closeWorkstreamMenu();
+                }}
+              >
+                <Text style={styles.modalPrimaryButtonText}>Save</Text>
+              </Pressable>
+
+              <Pressable
+                style={styles.modalCancelButton}
+                onPress={closeWorkstreamMenu}
+              >
+                <Text style={styles.modalCancelButtonText}>Cancel</Text>
+              </Pressable>
+            </View>
+          </View>
+        </Pressable>
+      </Modal>
+
 
     </SafeAreaView>
   );
@@ -3506,6 +3673,11 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: '#555',
     marginBottom: 12,
+  },
+  activeContextRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
   },
   section: {
     marginTop: 16,
@@ -3711,6 +3883,15 @@ const styles = StyleSheet.create({
   selectorPillTextDisabled: {
     color: '#777',
   },
+  
+  cadenceChipRow: {
+  flexDirection: 'row',
+  flexWrap: 'wrap',
+  gap: 6,
+  alignItems: 'center',
+},
+
+  
   // Cadence table styles
   pppHeaderRow: {
     flexDirection: 'row',
@@ -3731,7 +3912,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
     pppHeaderText: {
-    fontSize: 14,          // bigger
+    fontSize: 15,          // bigger
     fontWeight: '700',     // bolder
     color: '#333',
   },
@@ -3789,6 +3970,18 @@ const styles = StyleSheet.create({
     padding: 6,
     marginLeft: 4,
     justifyContent: 'center',
+  },
+  editableOutline: {
+    borderColor: '#81c784',
+    borderWidth: 1.5,
+  },
+  editableOutlineInput: {
+    borderColor: '#81c784',
+    borderWidth: 1.5,
+    borderRadius: 6,
+    paddingHorizontal: 6,
+    paddingVertical: 4,
+    marginTop: 4,
   },
   pppActionsCell: {
     flex: 0.8,
@@ -3978,6 +4171,11 @@ const styles = StyleSheet.create({
     backgroundColor: '#ffffff',
     marginBottom: 6,
   },
+  createHelperText: {
+    fontSize: 12,
+    color: '#607d8b',
+    marginBottom: 6,
+  },
   createActionsRow: {
     flexDirection: 'row',
     justifyContent: 'flex-end',
@@ -4135,6 +4333,16 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#cfd8dc',
     backgroundColor: '#fafafa',
+  },
+  kebabButtonSmall: {
+    marginLeft: 8,
+    paddingVertical: 4,
+    paddingHorizontal: 8,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#cfd8dc',
+    backgroundColor: '#fafafa',
+    alignSelf: 'flex-start',
   },
   kebabButtonText: {
     fontSize: 18,
