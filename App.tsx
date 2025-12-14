@@ -79,13 +79,26 @@ type SetupResult = {
   projectName: string;
   workstreams: {
     name: string;
+    cadence?: CadenceType; // ✅ WS-level cadence
     tasks: {
       name: string;
       owner?: string;
-      cadence?: CadenceType;
     }[];
   }[];
 };
+
+type OnboardingV1 = {
+  version: 1;
+  projects: {
+    name: string;
+    workstreams: {
+      name: string;
+      cadence?: CadenceType;
+      tasks: { name: string; owner?: string }[];
+    }[];
+  }[];
+};
+
 
 interface CadenceBackupV1 {
   version: 1;
@@ -1605,15 +1618,23 @@ export default function App() {
     loadState();
   }, []);
 
-  const handleSetupComplete = (data: SetupResult) => {
-    const nowStr = formatISODate(new Date());
+  const handleSetupComplete = (data: any) => {
+  const nowStr = formatISODate(new Date());
 
+  const isOnboardingV1 =
+    !!data &&
+    typeof data === 'object' &&
+    data.version === 1 &&
+    Array.isArray(data.projects);
+
+  // Helper: build nodes from a single project payload
+  const buildFromSingleProject = (projectName: string, workstreams: any[]) => {
     const projectId = generateNodeId('project');
 
     const projectNode: CadenceNode = {
       id: projectId,
       kind: 'project',
-      name: data.projectName || 'My first cadence project',
+      name: projectName || 'My first cadence project',
       cadence: 'weekly',
       cycles: [],
     };
@@ -1621,22 +1642,22 @@ export default function App() {
     const workstreamNodes: CadenceNode[] = [];
     const taskNodes: CadenceNode[] = [];
 
-    data.workstreams.forEach((ws) => {
+    (workstreams || []).forEach((ws) => {
       const wsId = generateNodeId('workstream');
+      const wsCadence: CadenceType = (ws?.cadence as CadenceType) || 'weekly';
 
       const wsNode: CadenceNode = {
         id: wsId,
         kind: 'workstream',
         parentId: projectId,
-        name: ws.name || 'Workstream',
-        cadence: 'weekly',
+        name: ws?.name || 'Workstream',
+        cadence: wsCadence,
         cycles: [],
       };
       workstreamNodes.push(wsNode);
 
-      ws.tasks.forEach((task) => {
+      (ws?.tasks || []).forEach((task: any) => {
         const taskId = generateNodeId('task');
-        const cadence = task.cadence || 'weekly';
 
         const firstCycle: CadenceCycle = {
           id: `${taskId}-period-1`,
@@ -1646,7 +1667,7 @@ export default function App() {
           previousPlan: '',
           actuals: '',
           nextPlan: '',
-          owner: (task.owner || '').trim(),
+          owner: String(task?.owner || '').trim(),
           reviewed: false,
         };
 
@@ -1654,8 +1675,8 @@ export default function App() {
           id: taskId,
           kind: 'task',
           parentId: wsId,
-          name: task.name || 'Task',
-          cadence,
+          name: task?.name || 'Task',
+          cadence: wsCadence, // ✅ tasks inherit from workstream
           cycles: [firstCycle],
         };
 
@@ -1674,9 +1695,23 @@ export default function App() {
       viewMode: 'review',
     }));
 
-    // Optional: reset review cycle offset to latest
     setReviewCycleOffset(0);
   };
+
+  if (isOnboardingV1) {
+    const onboarding = data as OnboardingV1;
+
+    // MVP: import only the first project (keeps UI simple)
+    const p0 = onboarding.projects[0];
+    buildFromSingleProject(p0?.name || 'Imported project', p0?.workstreams || []);
+    return;
+  }
+
+  // Fallback: existing demo/setup shape
+  const legacy = data as SetupResult;
+  buildFromSingleProject(legacy.projectName, legacy.workstreams);
+};
+
 
   // If we already have nodes from a previous run, skip SetupScreen
   useEffect(() => {
