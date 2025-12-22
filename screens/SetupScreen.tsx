@@ -1,64 +1,67 @@
-import React, { useState } from 'react';
-import { View, Text, TextInput, StyleSheet, Pressable, Platform } from 'react-native';
+import React, { useMemo, useState } from 'react';
+import { View, Text, TextInput, Pressable, StyleSheet, Platform } from 'react-native';
 
-interface SetupScreenProps {
-  // We keep this intentionally untyped here to avoid cross-file type imports.
-  onComplete: (data: any) => void;
-}
+// ------------------------------
+// Types (Onboarding V1)
+// ------------------------------
 
-// --- Stage 1 (mock) contract ---
-// We intentionally keep this local (no cross-file type imports).
-type CadenceType = 'daily' | 'weekly' | 'biweekly' | 'monthly' | 'quarterly';
-type OnboardingV1 = {
+type Cadence = 'daily' | 'weekly' | 'biweekly' | 'monthly' | 'quarterly';
+
+type OnboardingTask = {
+  name: string;
+  owner: string; // allow empty string
+};
+
+type OnboardingWorkstream = {
+  name: string;
+  cadence: Cadence;
+
+  // Always present (may be empty string)
+  lead: string;
+  milestone: string;
+  milestoneDate: string; // "" or YYYY-MM-DD
+
+  tasks: OnboardingTask[];
+};
+
+
+export type OnboardingV1 = {
   version: 1;
   projects: Array<{
     name: string;
-    workstreams: Array<{
-      name: string;
-      cadence: CadenceType;
-      tasks: Array<{ name: string; owner?: string }>;
-    }>;
+    workstreams: OnboardingWorkstream[];
   }>;
 };
 
-// ---- LLM helper (Stage 1 real) ----
-// Uses EXPO_PUBLIC_OPENAI_API_KEY from .env
+type SetupScreenProps = {
+  onComplete: (data: OnboardingV1) => void;
+};
+
+// ------------------------------
+// OpenAI helpers (unchanged style, but schema updated)
+// ------------------------------
+
 function getExpoPublicApiKey(): string | undefined {
-  // Expo typically supports process.env.* in JS bundler; but some web setups can be finicky.
-  // This tries a couple of safe paths.
-  const p: any = (globalThis as any).process ?? (globalThis as any).global?.process;
-  const key =
-    (p?.env?.EXPO_PUBLIC_OPENAI_API_KEY as string | undefined) ||
-    ((process as any)?.env?.EXPO_PUBLIC_OPENAI_API_KEY as string | undefined);
-  return key;
+  // Matches your existing approach: EXPO_PUBLIC_OPENAI_API_KEY
+  // If you used a different env var, change it here.
+  // @ts-ignore
+  return typeof process !== 'undefined' ? process.env.EXPO_PUBLIC_OPENAI_API_KEY : undefined;
 }
 
 function extractModelTextFromResponsesApi(data: any): string | undefined {
-  if (!data || typeof data !== 'object') return undefined;
-
-  // Back-compat / convenience field (sometimes present)
-  if (typeof data.output_text === 'string' && data.output_text.trim()) {
-    return data.output_text;
-  }
-
-  // Responses API: data.output[] contains items, typically { type:"message", content:[...] }
-  const out = Array.isArray(data.output) ? data.output : [];
+  // Supports response.output[].message.content[] or output_text-like parts
+  const out: any[] = Array.isArray(data?.output) ? data.output : [];
   const parts: string[] = [];
 
   for (const item of out) {
-    // Some SDK shapes: item.content or item.message.content
     const contentArr =
       (Array.isArray(item?.content) && item.content) ||
       (Array.isArray(item?.message?.content) && item.message.content) ||
       [];
 
     for (const c of contentArr) {
-      // Content parts can be objects like { type:"output_text"|"text", text:"..." }
-      if (typeof c?.text === 'string' && c.text.trim()) {
-        parts.push(c.text);
-      } else if (typeof c === 'string' && c.trim()) {
-        parts.push(c);
-      }
+      if (typeof c?.text === 'string' && c.text.trim()) parts.push(c.text);
+      else if (typeof c === 'string' && c.trim()) parts.push(c);
     }
   }
 
@@ -74,6 +77,7 @@ async function parseSetupWithLLM(freeform: string): Promise<OnboardingV1> {
     );
   }
 
+  // ✅ Updated schema: adds optional lead, milestone, milestoneDate
   const schema = {
     name: 'cadence_onboarding_v1',
     strict: true,
@@ -100,6 +104,16 @@ async function parseSetupWithLLM(freeform: string): Promise<OnboardingV1> {
                       type: 'string',
                       enum: ['daily', 'weekly', 'biweekly', 'monthly', 'quarterly'],
                     },
+
+                    // optional but allowed
+                    lead: { type: 'string' },
+                    milestone: { type: 'string' },
+                    milestoneDate: {
+                      type: 'string',
+                      // keep strict but simple; allows empty if user didn't give it
+                      pattern: '^\\d{4}-\\d{2}-\\d{2}$',
+                    },
+
                     tasks: {
                       type: 'array',
                       items: {
@@ -113,7 +127,8 @@ async function parseSetupWithLLM(freeform: string): Promise<OnboardingV1> {
                       },
                     },
                   },
-                  required: ['name', 'cadence', 'tasks'],
+                  required: ['name', 'cadence', 'lead', 'milestone', 'milestoneDate', 'tasks'],
+
                 },
               },
             },
@@ -126,15 +141,21 @@ async function parseSetupWithLLM(freeform: string): Promise<OnboardingV1> {
   } as const;
 
   const system = [
-    'You are an onboarding parser for the Cadence App.',
-    'Convert the user text into STRICT JSON matching the provided schema.',
-    'Rules:',
-    '- Always output version: 1.',
-    '- If a task has no owner, use empty string for owner.',
-    '- If workstreams/tasks are missing, create reasonable defaults but keep arrays valid.',
-    '- Cadence must be one of: daily, weekly, biweekly, monthly, quarterly.',
-    '- Output ONLY JSON, no markdown, no explanations.',
-  ].join('\n');
+  'You are an onboarding parser for the Cadence App.',
+  'Convert the user text into STRICT JSON matching the provided schema.',
+  'Rules:',
+  '- Always output version: 1.',
+  '- If a task has no owner, use empty string for owner.',
+  '- For every workstream, ALWAYS include lead, milestone, and milestoneDate fields.',
+  '- If a workstream lead is not stated, set lead to empty string (do NOT omit it).',
+  '- If a milestone is not stated, set milestone to empty string (do NOT omit it).',
+  '- If a milestone date is not provided, set milestoneDate to empty string (do NOT invent a date).',
+  '- If a milestone date IS provided, milestoneDate must be YYYY-MM-DD.',
+  '- If workstreams/tasks are missing, create reasonable defaults but keep arrays valid.',
+  '- Cadence must be one of: daily, weekly, biweekly, monthly, quarterly.',
+  '- Output ONLY JSON, no markdown, no explanations.',
+].join('\n');
+
 
   const body = {
     model: 'gpt-4o-mini',
@@ -172,13 +193,16 @@ async function parseSetupWithLLM(freeform: string): Promise<OnboardingV1> {
 
   const parsed = JSON.parse(jsonText);
 
-  // Lightweight validation (keeps MVP safe)
   if (!parsed || parsed.version !== 1 || !Array.isArray(parsed.projects)) {
     throw new Error('LLM returned invalid onboarding JSON (expected version:1 + projects array).');
   }
 
   return parsed as OnboardingV1;
 }
+
+// ------------------------------
+// UI
+// ------------------------------
 
 const SetupScreen: React.FC<SetupScreenProps> = ({ onComplete }) => {
   const [prompt, setPrompt] = useState('');
@@ -188,83 +212,55 @@ const SetupScreen: React.FC<SetupScreenProps> = ({ onComplete }) => {
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   const buildMockOnboardingJson = (freeform: string): OnboardingV1 => {
-    const firstLine = (freeform || '').split('\n')[0]?.trim();
-    const projectName =
-      firstLine && firstLine.length > 0 ? firstLine : 'Cadence App v1 – PPP Prototype';
+  const firstLine = (freeform || '').split('\n')[0]?.trim();
+  const projectName = firstLine && firstLine.length > 0 ? firstLine : 'Cadence App – Demo';
 
-    return {
-      version: 1,
-      projects: [
-        {
-          name: projectName,
-          workstreams: [
-            {
-              name: 'Product & UX (Aria)',
-              cadence: 'weekly',
-              tasks: [
-                { name: 'Refine Cadence Review layout and pills', owner: 'Aria' },
-                { name: 'Design Setup Wizard Stage 0 → 1 flow', owner: 'Aria' },
-              ],
-            },
-            {
-              name: 'Architecture & Data Model (Nikolai)',
-              cadence: 'weekly',
-              tasks: [
-                { name: 'Harden PPP cycle immutability rules', owner: 'Nikolai' },
-                { name: 'Define cadence types and date helpers', owner: 'Nikolai' },
-              ],
-            },
-            {
-              name: 'Engineering & Implementation (Maya)',
-              cadence: 'weekly',
-              tasks: [
-                { name: 'Refactor App.tsx into screens/hooks', owner: 'Maya' },
-                { name: 'Wire SetupScreen into main app state', owner: 'Maya' },
-              ],
-            },
-            {
-              name: 'AI Onboarding & Prompts (Leo)',
-              cadence: 'weekly',
-              tasks: [
-                { name: 'Define Stage 0 → 1 → 2 prompt schema', owner: 'Leo' },
-                { name: 'Draft JSON spec for cadence parsing', owner: 'Leo' },
-              ],
-            },
-            {
-              name: 'QA & Release (Sofia)',
-              cadence: 'weekly',
-              tasks: [
-                { name: 'Regression test PPP cycle transitions', owner: 'Sofia' },
-                { name: 'Test Setup Wizard reset and edge cases', owner: 'Sofia' },
-              ],
-            },
-          ],
-        },
-      ],
-    };
+  return {
+    version: 1,
+    projects: [
+      {
+        name: projectName,
+        workstreams: [
+          {
+            name: 'Execution OS Rollout',
+            cadence: 'weekly',
+            lead: 'Ops Lead',
+            milestone: 'First 3 teams running weekly cadence',
+            milestoneDate: '2026-01-31',
+            tasks: [
+              { name: 'Draft meeting agenda template', owner: 'Aria' },
+              { name: 'Pilot with one team', owner: 'Dmitri' },
+            ],
+          },
+          {
+            name: 'Product & UX',
+            cadence: 'weekly',
+            lead: 'Aria',
+            milestone: '',
+            milestoneDate: '',
+            tasks: [
+              { name: 'Polish Meeting mode layout', owner: 'Aria' },
+              { name: 'Simplify Owner prep inputs', owner: 'Aria' },
+            ],
+          },
+        ],
+      },
+    ],
   };
+};
 
-  const onboardingJsonToSetupResult = (obj: OnboardingV1) => {
-    const proj = obj.projects?.[0];
-    return {
-      projectName: proj?.name || 'My first cadence project',
-      workstreams: (proj?.workstreams || []).map((ws) => ({
-        name: ws.name || 'Workstream',
-        tasks: (ws.tasks || []).map((t) => ({
-          name: t.name || 'Task',
-          owner: (t.owner || '').trim(),
-          // Back-compat: App.tsx may still accept task-level cadence.
-          cadence: ws.cadence || 'weekly',
-        })),
-      })),
-    };
-  };
+
+  function validateOnboarding(obj: any): asserts obj is OnboardingV1 {
+  if (!obj || obj.version !== 1 || !Array.isArray(obj.projects)) {
+    throw new Error('Invalid onboarding JSON. Expected { version: 1, projects: [...] }.');
+  }
+}
+
 
   const handleGenerateMockJson = () => {
     if (isSubmitting) return;
     setIsSubmitting(true);
     setJsonError(null);
-
     try {
       const obj = buildMockOnboardingJson(prompt);
       setGeneratedJson(JSON.stringify(obj, null, 2));
@@ -280,7 +276,6 @@ const SetupScreen: React.FC<SetupScreenProps> = ({ onComplete }) => {
     try {
       setJsonError(null);
       setIsSubmitting(true);
-
       const parsed = await parseSetupWithLLM(prompt);
       setGeneratedJson(JSON.stringify(parsed, null, 2));
     } catch (e: any) {
@@ -290,21 +285,17 @@ const SetupScreen: React.FC<SetupScreenProps> = ({ onComplete }) => {
     }
   };
 
+  // ✅ Option B: Import OnboardingV1 directly
   const handleUseJson = () => {
     if (isSubmitting) return;
     setIsSubmitting(true);
     setJsonError(null);
     try {
       const raw = (generatedJson || '').trim();
-      if (!raw) {
-        throw new Error('Generate (or paste) onboarding JSON first.');
-      }
+      if (!raw) throw new Error('Generate (or paste) onboarding JSON first.');
       const parsed: any = JSON.parse(raw);
-      if (!parsed || parsed.version !== 1 || !Array.isArray(parsed.projects)) {
-        throw new Error('Invalid onboarding JSON. Expected { version: 1, projects: [...] }.');
-      }
-      const data = onboardingJsonToSetupResult(parsed as OnboardingV1);
-      onComplete(data);
+      validateOnboarding(parsed);
+      onComplete(parsed);
     } catch (e: any) {
       setJsonError(e?.message || 'Failed to parse onboarding JSON.');
       setIsSubmitting(false);
@@ -318,13 +309,10 @@ const SetupScreen: React.FC<SetupScreenProps> = ({ onComplete }) => {
       setIsSubmitting(true);
 
       const parsed = await parseSetupWithLLM(prompt);
-
-      // Keep JSON available for Advanced view / debugging
       setGeneratedJson(JSON.stringify(parsed, null, 2));
 
-      // 🚀 Behind the curtain: immediately complete setup
-      const setupData = onboardingJsonToSetupResult(parsed);
-      onComplete(setupData);
+      // ✅ Option B: complete setup with V1 payload
+      onComplete(parsed);
     } catch (e: any) {
       setJsonError(e?.message || 'LLM parsing failed.');
     } finally {
@@ -339,28 +327,26 @@ const SetupScreen: React.FC<SetupScreenProps> = ({ onComplete }) => {
       setIsSubmitting(true);
 
       const obj = buildMockOnboardingJson(prompt);
-
-      // Keep JSON available for Advanced view / debugging
       setGeneratedJson(JSON.stringify(obj, null, 2));
 
-      // 🚀 Behind the curtain: immediately complete setup
-      const setupData = onboardingJsonToSetupResult(obj);
-      onComplete(setupData);
+      // ✅ Option B: complete setup with V1 payload
+      onComplete(obj);
     } catch (e: any) {
       setJsonError(e?.message || 'Failed to create mock workspace.');
-      setIsSubmitting(false);
     } finally {
       setIsSubmitting(false);
     }
   };
 
+  const subtitle = useMemo(() => 'Stage 0 · Demo Mode', []);
+
   return (
     <View style={styles.container}>
       <Text style={styles.title}>Welcome to Cadence Setup Wizard</Text>
-      <Text style={styles.subtitle}>Stage 0 · Demo Mode</Text>
+      <Text style={styles.subtitle}>{subtitle}</Text>
 
       <Text style={styles.helpText}>
-        Describe your projects, workstreams, and tasks. We’ll create your workspace automatically.
+        Describe your project(s), workstreams, tasks — and milestones if you have them.
         {Platform.OS === 'web'
           ? '\n\nNote: LLM may require an API key and may hit CORS on web depending on setup.'
           : ''}
@@ -368,7 +354,12 @@ const SetupScreen: React.FC<SetupScreenProps> = ({ onComplete }) => {
 
       <TextInput
         style={styles.textArea}
-        placeholder="E.g. Project: X. Workstream: Y cadence weekly. Tasks: A (Owner), B (Owner)..."
+        placeholder={
+          'Example:\n' +
+          'Project: Q1 Operating Rhythm\n' +
+          'Workstream: Growth cadence weekly lead Sarah milestone Launch v2 by 2026-02-15\n' +
+          'Tasks: Website experiments (Alex), Partnerships (Taylor)\n'
+        }
         multiline
         value={prompt}
         onChangeText={setPrompt}
@@ -511,9 +502,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#9ccc65',
   },
-  buttonDisabled: {
-    opacity: 0.7,
-  },
+  buttonDisabled: { opacity: 0.7 },
   buttonText: {
     fontSize: 13,
     fontWeight: '700',

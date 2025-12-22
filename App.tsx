@@ -1,4514 +1,1316 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   SafeAreaView,
   ScrollView,
   View,
   Text,
   TextInput,
-  StyleSheet,
   Pressable,
-  Modal,
+  StyleSheet,
+  Alert,
   Platform,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import DateTimePicker from '@react-native-community/datetimepicker';
 
+import SetupScreen, { OnboardingV1 } from './screens/SetupScreen';
 
-// ---- Stage 0 LLM onboarding screen ----
+// ------------------------------
+// Types
+// ------------------------------
 
-import SetupScreen from './screens/SetupScreen';
+type Cadence = 'daily' | 'weekly' | 'biweekly' | 'monthly' | 'quarterly';
+type Screen = 'meeting' | 'owners' | 'manage';
+type TaskLifecycle = 'active' | 'inactive';
 
-// ---- Domain types ----
-
-type CadenceKind = 'project' | 'workstream' | 'task';
-type CycleStatus = 'open' | 'closed';
-type CadenceType = 'daily' | 'weekly' | 'biweekly' | 'monthly' | 'quarterly';
-
-interface CadenceCycle {
+interface Project {
   id: string;
-  index: number; // 0,1,2...
-  status: CycleStatus;
-  startDate?: string;
-  endDate?: string;
-  previousPlan: string;
+  name: string;
+}
+
+interface Workstream {
+  id: string;
+  projectId: string;
+  name: string;
+  lead?: string;
+  cadence: Cadence;
+  firstCycleStartDate: string; // YYYY-MM-DD
+  milestone?: string;
+  milestoneDate?: string; // YYYY-MM-DD
+}
+
+interface Cycle {
+  index: number;
+  status: 'open' | 'closed';
+  startDate: string; // YYYY-MM-DD
+  endDate?: string; // YYYY-MM-DD
+  previousPlan: string; // derived from prior nextPlan
   actuals: string;
   nextPlan: string;
-  owner: string; // per-period ownership
-  reviewed?: boolean; // true when "Complete Update" is clicked for this cycle
+  owner: string;
+  reviewed: boolean;
 }
 
-interface CadenceNode {
+interface Task {
   id: string;
-  kind: CadenceKind;
-  parentId?: string; // undefined for top-level projects
+  workstreamId: string;
   name: string;
-  cadence: CadenceType;
-  pendingCadence?: CadenceType; // workstream-level cadence change, effective next cycle
-  cycles: CadenceCycle[]; // for MVP, cadence table is meaningful only for tasks
-  retired?: boolean;
-
-  // Workstream milestone support (for kind === 'workstream')
-  milestone?: string;
-  milestoneDate?: string;
+  owner: string;
+  lifecycle: TaskLifecycle;
+  cycles: Cycle[];
+  createdAt: string; // YYYY-MM-DD
 }
-
-type ViewMode = 'review' | 'owners' | 'open';
-
-type DueState = 'ontime' | 'duesoon' | 'overdue';
 
 interface AppState {
-  nodes: CadenceNode[];
-  activeProjectId?: string;
-  activeWorkstreamId?: string;
-  activeTaskId?: string;
-  viewMode: ViewMode;
-  activeOwner?: string;
-  ownerVisibleNodeIds: string[];
-
-  // Filters for Open mode
-  openOwnerFilter?: string;
-  openKindFilter: 'all' | CadenceKind;
-  openCadenceFilter: 'all' | CadenceType;
-  openDueFilter: 'all' | DueState;
-
-  // Workstream milestone toggle
-  showWorkstreamMilestones: boolean;
+  projects: Project[];
+  workstreams: Workstream[];
+  tasks: Task[];
+  selectedProjectId?: string;
+  selectedWorkstreamId?: string;
 }
 
-type SetupResult = {
-  projectName: string;
-  workstreams: {
-    name: string;
-    cadence?: CadenceType; // ✅ WS-level cadence
-    tasks: {
-      name: string;
-      owner?: string;
-    }[];
-  }[];
-};
+// ------------------------------
+// Storage
+// ------------------------------
 
-type OnboardingV1 = {
-  version: 1;
-  projects: {
-    name: string;
-    workstreams: {
-      name: string;
-      cadence?: CadenceType;
-      tasks: { name: string; owner?: string }[];
-    }[];
-  }[];
-};
+const STORAGE_KEY = 'cadence_exec_os_mvp_v2'; // bump key so you can compare behaviors safely
 
+// ------------------------------
+// Date helpers
+// ------------------------------
 
-interface CadenceBackupV1 {
-  version: 1;
-  createdAt: string;
-  note?: string;
-  state: AppState;
+function pad2(n: number) {
+  return n < 10 ? `0${n}` : `${n}`;
 }
 
-// ---- Initial sample state ----
-
-const initialState: AppState = {
-  nodes: [],
-  activeProjectId: undefined,
-  activeWorkstreamId: undefined,
-  activeTaskId: undefined,
-  viewMode: 'review',
-  activeOwner: undefined,
-  ownerVisibleNodeIds: [],
-
-  openOwnerFilter: undefined,
-  openKindFilter: 'all',
-  openCadenceFilter: 'all',
-  openDueFilter: 'all',
-
-  showWorkstreamMilestones: false,
-};
-
-// ---- Helper functions ----
-
-function getProjects(nodes: CadenceNode[]): CadenceNode[] {
-  return nodes.filter((n) => n.kind === 'project' && !n.retired);
+function toISODate(d: Date): string {
+  const year = d.getFullYear();
+  const month = pad2(d.getMonth() + 1);
+  const day = pad2(d.getDate());
+  return `${year}-${month}-${day}`;
 }
 
-function getWorkstreamsForProject(
-  nodes: CadenceNode[],
-  projectId: string | undefined
-): CadenceNode[] {
-  if (!projectId) {
-    return nodes.filter((n) => n.kind === 'workstream' && !n.retired);
-  }
-  return nodes.filter(
-    (n) =>
-      n.kind === 'workstream' && n.parentId === projectId && !n.retired
-  );
+function parseISODate(s: string): Date {
+  const [y, m, d] = s.split('-').map((x) => parseInt(x, 10));
+  return new Date(y, (m || 1) - 1, d || 1);
 }
 
-function getAllWorkstreams(nodes: CadenceNode[]): CadenceNode[] {
-  return nodes.filter((n) => n.kind === 'workstream' && !n.retired);
+function formatHumanDate(iso: string): string {
+  const d = parseISODate(iso);
+  return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
 }
 
-function getTasksForWorkstream(
-  nodes: CadenceNode[],
-  workstreamId: string | undefined
-): CadenceNode[] {
-  if (!workstreamId) {
-    return nodes.filter((n) => n.kind === 'task' && !n.retired);
-  }
-  return nodes.filter(
-    (n) =>
-      n.kind === 'task' && n.parentId === workstreamId && !n.retired
-  );
+function addDays(d: Date, days: number): Date {
+  const x = new Date(d);
+  x.setDate(x.getDate() + days);
+  return x;
 }
 
-function getTasksForProject(
-  nodes: CadenceNode[],
-  projectId: string | undefined
-): CadenceNode[] {
-  if (!projectId) {
-    return nodes.filter((n) => n.kind === 'task' && !n.retired);
-  }
-  const workstreams = nodes.filter(
-    (n) =>
-      n.kind === 'workstream' && n.parentId === projectId && !n.retired
-  );
-  const wsIds = new Set(workstreams.map((w) => w.id));
-  return nodes.filter(
-    (n) =>
-      n.kind === 'task' &&
-      !n.retired &&
-      n.parentId &&
-      wsIds.has(n.parentId)
-  );
+function addMonths(d: Date, months: number): Date {
+  const x = new Date(d);
+  x.setMonth(x.getMonth() + months);
+  return x;
 }
 
-// generic children
-function getChildren(nodes: CadenceNode[], parentId: string): CadenceNode[] {
-  return nodes.filter((n) => n.parentId === parentId && !n.retired);
+function startOfWeekMonday(d: Date): Date {
+  const x = new Date(d);
+  const day = x.getDay(); // 0 Sun..6 Sat
+  const diff = (day + 6) % 7; // Monday=0
+  x.setDate(x.getDate() - diff);
+  x.setHours(0, 0, 0, 0);
+  return x;
 }
 
-// Determine which node's cadence table we are currently viewing for context:
-function getCurrentNode(state: AppState): CadenceNode | undefined {
-  const { nodes, activeTaskId, activeWorkstreamId, activeProjectId } = state;
-
-  if (activeTaskId) {
-    const task = nodes.find((n) => n.id === activeTaskId && !n.retired);
-    if (task) return task;
-  }
-  if (activeWorkstreamId) {
-    const ws = nodes.find(
-      (n) => n.id === activeWorkstreamId && !n.retired
-    );
-    if (ws) return ws;
-  }
-  if (activeProjectId) {
-    const proj = nodes.find((n) => n.id === activeProjectId && !n.retired);
-    if (proj) return proj;
-  }
-  return nodes.find((n) => !n.retired);
+function startOfQuarter(d: Date): Date {
+  const x = new Date(d);
+  const q = Math.floor(x.getMonth() / 3);
+  return new Date(x.getFullYear(), q * 3, 1);
 }
 
-// Current cycle: open if exists, else last
-function getCurrentCycle(node: CadenceNode): CadenceCycle {
-  const open = node.cycles.find((c: CadenceCycle) => c.status === 'open');
-  if (open) return open;
-  return node.cycles[node.cycles.length - 1];
+function cadenceDefaultStart(today: Date, cadence: Cadence): Date {
+  const t = new Date(today);
+  t.setHours(0, 0, 0, 0);
+  if (cadence === 'daily') return t;
+  if (cadence === 'weekly' || cadence === 'biweekly') return startOfWeekMonday(t);
+  if (cadence === 'monthly') return new Date(t.getFullYear(), t.getMonth(), 1);
+  return startOfQuarter(t);
 }
 
-
-
-// ---- Date helpers ----
-
-const MS_PER_DAY = 1000 * 60 * 60 * 24;
-
-function parseISODate(dateStr: string): Date {
-  return new Date(dateStr + 'T00:00:00');
+function cadenceIncrement(start: Date, cadence: Cadence, steps: number): Date {
+  const x = new Date(start);
+  x.setHours(0, 0, 0, 0);
+  if (cadence === 'daily') return addDays(x, steps);
+  if (cadence === 'weekly') return addDays(x, 7 * steps);
+  if (cadence === 'biweekly') return addDays(x, 14 * steps);
+  if (cadence === 'monthly') return addMonths(x, steps);
+  return addMonths(x, 3 * steps);
 }
 
-function formatISODate(date: Date): string {
-  return date.toISOString().slice(0, 10);
-}
+function getCycleForDate(todayISO: string, firstStartISO: string, cadence: Cadence) {
+  const today = parseISODate(todayISO);
+  const first = parseISODate(firstStartISO);
+  today.setHours(0, 0, 0, 0);
+  first.setHours(0, 0, 0, 0);
 
-function getPeriodLengthDays(cadence: CadenceType): number {
-  switch (cadence) {
-    case 'daily':
-      return 1;
-    case 'weekly':
-      return 7;
-    case 'biweekly':
-      return 14;
-    case 'monthly':
-      return 30;
-    case 'quarterly':
-      return 90;
-    default:
-      return 7;
-  }
-}
-
-function addDays(date: Date, days: number): Date {
-  const d = new Date(date.getTime());
-  d.setDate(d.getDate() + days);
-  return d;
-}
-
-// Human-readable date formatting: "March 1" or "March 1 – March 7" (no year)
-function formatHumanDate(dateStr?: string): string | undefined {
-  if (!dateStr) return undefined;
-  try {
-    const d = parseISODate(dateStr);
-    if (Number.isNaN(d.getTime())) return dateStr;
-    const monthNames = [
-      'January',
-      'February',
-      'March',
-      'April',
-      'May',
-      'June',
-      'July',
-      'August',
-      'September',
-      'October',
-      'November',
-      'December',
-    ];
-    const month = monthNames[d.getMonth()];
-    const day = d.getDate();
-    return `${month} ${day}`;
-  } catch {
-    return dateStr;
-  }
-}
-
-function formatHumanDateRange(
-  startStr?: string,
-  endStr?: string
-): string | undefined {
-  if (!startStr && !endStr) return undefined;
-  const startLabel = formatHumanDate(startStr);
-  const endLabel = formatHumanDate(endStr);
-  if (startLabel && endLabel) {
-    return `${startLabel} – ${endLabel}`;
-  }
-  return startLabel || endLabel || undefined;
-}
-
-function getNextPeriodRange(
-  node: CadenceNode,
-  cycle: CadenceCycle
-): { start: string; end: string } | undefined {
-  const len = getPeriodLengthDays(node.cadence);
-
-  if (cycle.endDate) {
-    const end = parseISODate(cycle.endDate);
-    const nextStart = addDays(end, 1);
-    const nextEnd = addDays(nextStart, len - 1);
-    return {
-      start: formatISODate(nextStart),
-      end: formatISODate(nextEnd),
-    };
+  if (first.getTime() > today.getTime()) {
+    const start = first;
+    const next = cadenceIncrement(start, cadence, 1);
+    const end = addDays(next, -1);
+    return { currentIndex: 0, startISO: toISODate(start), endISO: toISODate(end) };
   }
 
-  if (cycle.startDate) {
-    const startCur = parseISODate(cycle.startDate);
-    const nextStart = addDays(startCur, len);
-    const nextEnd = addDays(nextStart, len - 1);
-    return {
-      start: formatISODate(nextStart),
-      end: formatISODate(nextEnd),
-    };
-  }
-
-  return undefined;
-}
-
-// Target end date for an open cycle
-function getTargetEndDate(
-  node: CadenceNode,
-  cycle: CadenceCycle
-): Date | undefined {
-  if (cycle.endDate) {
-    return parseISODate(cycle.endDate);
-  }
-  if (cycle.startDate) {
-    const len = getPeriodLengthDays(node.cadence);
-    const start = parseISODate(cycle.startDate);
-    return addDays(start, len - 1);
-  }
-  return undefined;
-}
-
-// Due-state calculation for open cycles
-function getDueStateForCycle(
-  node: CadenceNode,
-  cycle: CadenceCycle,
-  today: Date
-): DueState {
-  if (cycle.status !== 'open') return 'ontime';
-
-  const targetEnd = getTargetEndDate(node, cycle);
-  if (!targetEnd) {
-    return 'ontime';
-  }
-
-  const diffDays = Math.floor(
-    (targetEnd.getTime() - today.getTime()) / MS_PER_DAY
-  );
-
-  if (diffDays < 0) {
-    return 'overdue';
-  }
-
-  // "Due soon" if within 2 days of target end
-  if (diffDays <= 2) {
-    return 'duesoon';
-  }
-
-  return 'ontime';
-}
-
-// ---- Close period ----
-
-function closeCurrentCycle(node: CadenceNode): CadenceNode {
-  const current = getCurrentCycle(node);
-  const len = getPeriodLengthDays(node.cadence);
-
-  let closedEnd: Date;
-  let nextStart: Date;
-
-  if (current.startDate) {
-    // Normal case: derive everything from the period start + cadence
-    const start = parseISODate(current.startDate);
-    closedEnd = addDays(start, len - 1); // end of this period
-    nextStart = addDays(start, len);     // start of next period
-  } else if (current.endDate) {
-    // Fallback: if we somehow only have an end date
-    const end = parseISODate(current.endDate);
-    closedEnd = end;
-    nextStart = addDays(end, 1);
-  } else {
-    // Last-resort fallback: use "today"
-    const today = new Date();
-    closedEnd = today;
-    nextStart = addDays(today, len);
-  }
-
-  const closedEndStr = formatISODate(closedEnd);
-  const nextStartStr = formatISODate(nextStart);
-
-  const nextIndex = node.cycles.length;
-
-  const closedCycles: CadenceCycle[] = node.cycles.map((c: CadenceCycle) =>
-    c.id === current.id
-      ? {
-          ...c,
-          status: 'closed' as CycleStatus,
-          endDate: closedEndStr,
-        }
-      : c
-  );
-
-  const newCycle: CadenceCycle = {
-    id: `${node.id}-period-${nextIndex + 1}`,
-    index: nextIndex,
-    status: 'open',
-    startDate: nextStartStr,
-    previousPlan: current.nextPlan || '(carry-over plan)',
-    actuals: '',
-    nextPlan: '',
-    owner: current.owner || '',
-    reviewed: false,
-  };
-
-  return {
-    ...node,
-    cycles: [...closedCycles, newCycle],
-  };
-}
-
-
-
-// ---- Cadence helpers ----
-
-function getCadenceReviewTitle(cadence: CadenceType): string {
-  switch (cadence) {
-    case 'daily':
-      return 'Daily Review';
-    case 'weekly':
-      return 'Weekly Review';
-    case 'biweekly':
-      return 'Biweekly Review';
-    case 'monthly':
-      return 'Monthly Review';
-    case 'quarterly':
-      return 'Quarterly Review';
-    default:
-      return 'Cadence Review';
-  }
-}
-
-
-function getCadenceLabel(cadence: CadenceType): string {
-  switch (cadence) {
-    case 'daily':
-      return 'day';
-    case 'weekly':
-      return 'week';
-    case 'biweekly':
-      return 'two weeks';
-    case 'monthly':
-      return 'month';
-    case 'quarterly':
-      return 'quarter';
-    default:
-      return 'period';
-  }
-}
-
-function getNodeLabelPrefix(kind: CadenceKind): string {
-  return kind === 'project'
-    ? 'Project'
-    : kind === 'workstream'
-    ? 'Workstream'
-    : 'Task';
-}
-
-function nodeOwnedBy(node: CadenceNode, owner: string | undefined): boolean {
-  if (!owner) return false;
-  if (!node.cycles || node.cycles.length === 0) return false;
-
-  const cycle = getCurrentCycle(node);
-  if (!cycle) return false;
-
-  return (cycle.owner || '').trim() === owner.trim();
-}
-
-function nodeOrDescendantOwnedBy(
-  node: CadenceNode,
-  nodes: CadenceNode[],
-  owner: string | undefined
-): boolean {
-  if (!owner) return false;
-  if (nodeOwnedBy(node, owner)) return true;
-  const children = getChildren(nodes, node.id);
-  for (const child of children) {
-    if (nodeOrDescendantOwnedBy(child, nodes, owner)) return true;
-  }
-  return false;
-}
-
-function isDescendantOf(
-  nodes: CadenceNode[],
-  node: CadenceNode,
-  ancestorId: string
-): boolean {
-  let currentParentId = node.parentId;
-  while (currentParentId) {
-    if (currentParentId === ancestorId) return true;
-    const parent = nodes.find((n) => n.id === currentParentId);
-    if (!parent) break;
-    currentParentId = parent.parentId;
-  }
-  return false;
-}
-
-function ownedNodesUnder(
-  nodeId: string,
-  nodes: CadenceNode[],
-  owner: string
-): string[] {
-  return nodes
-    .filter(
-      (n) =>
-        nodeOwnedBy(n, owner) &&
-        (n.id === nodeId || isDescendantOf(nodes, n, nodeId))
-    )
-    .map((n) => n.id);
-}
-
-// ---- Owner summaries ----
-
-interface OwnerSummaryEntry {
-  node: CadenceNode;
-  cycle: CadenceCycle;
-}
-
-interface OwnerSummary {
-  owner: string;
-  entries: OwnerSummaryEntry[];
-}
-
-function getOwnerSummaries(nodes: CadenceNode[]): OwnerSummary[] {
-  const map = new Map<string, OwnerSummaryEntry[]>();
-
-  nodes.forEach((node) => {
-    if (node.kind !== 'task' || node.retired) return;
-    if (!node.cycles || node.cycles.length === 0) return;
-    const cycle = getCurrentCycle(node);
-    const owner = (cycle.owner || '').trim();
-    if (!owner) return;
-    if (!map.has(owner)) {
-      map.set(owner, []);
+  let idx = 0;
+  let start = new Date(first);
+  while (true) {
+    const next = cadenceIncrement(start, cadence, 1);
+    if (next.getTime() > today.getTime()) {
+      const end = addDays(next, -1);
+      return { currentIndex: idx, startISO: toISODate(start), endISO: toISODate(end) };
     }
-    map.get(owner)!.push({ node, cycle });
-  });
-
-  const summaries: OwnerSummary[] = [];
-  for (const [owner, entries] of map.entries()) {
-    summaries.push({ owner, entries });
+    start = next;
+    idx += 1;
+    if (idx > 2000) break;
   }
-  summaries.sort((a, b) => a.owner.localeCompare(b.owner));
-  return summaries;
+
+  const next = cadenceIncrement(first, cadence, 1);
+  return { currentIndex: 0, startISO: toISODate(first), endISO: toISODate(addDays(next, -1)) };
 }
 
-// ---- Cadence header ----
-interface PPPHeaderProps {
-  nextPlanHeader: string;
-  showActions?: boolean;
-  previousDateLabel?: string;
-  actualDateLabel?: string;
-  nextDateLabel?: string;
-  previousLocked?: boolean;  // show red "Locked" tag
-  actualEditable?: boolean;  // show green "Editable" tag under Actuals
-  nextEditable?: boolean;    // show green "Editable" tag under Next Plan
+function safeTrim(s: string) {
+  return (s || '').trim();
 }
 
-
-const PPPHeaderRow: React.FC<PPPHeaderProps> = ({
-  nextPlanHeader,
-  showActions,
-  previousDateLabel,
-  actualDateLabel,
-  nextDateLabel,
-  previousLocked,
-  actualEditable,
-  nextEditable,
-}) => (
-  <View style={styles.pppHeaderRow}>
-    {/* Object column */}
-    <View style={[styles.pppHeaderCell, styles.pppObjectHeaderCell]} />
-
-
-    {/* Previous Plan */}
-    <View style={styles.pppHeaderCell}>
-      <Text style={styles.pppHeaderText}>Previous Plan</Text>
-      {previousDateLabel ? (
-        <Text style={styles.pppHeaderSubText}>{previousDateLabel}</Text>
-      ) : null}
-      {previousLocked && (
-        <Text style={styles.pppHeaderLockedTag}>Locked</Text>
-      )}
-    </View>
-
-    {/* Actuals */}
-    <View style={styles.pppHeaderCell}>
-      <Text style={styles.pppHeaderText}>Actuals</Text>
-      {actualDateLabel ? (
-        <Text style={styles.pppHeaderSubText}>{actualDateLabel}</Text>
-      ) : null}
-      {actualEditable && (
-        <Text style={styles.pppHeaderEditableTag}>Editable</Text>
-      )}
-    </View>
-
-    {/* Next Plan */}
-    <View style={styles.pppHeaderCell}>
-      <Text style={styles.pppHeaderText}>{nextPlanHeader}</Text>
-      {nextDateLabel ? (
-        <Text style={styles.pppHeaderSubText}>{nextDateLabel}</Text>
-      ) : null}
-      {nextEditable && (
-        <Text style={styles.pppHeaderEditableTag}>Editable</Text>
-      )}
-    </View>
-
-    {/* Optional Actions column */}
-    {showActions && (
-      <View style={[styles.pppHeaderCell, styles.pppActionsHeaderCell]}>
-        <Text style={styles.pppHeaderText}>Actions</Text>
-      </View>
-    )}
-  </View>
-);
-
-
-
-// ---- Cadence row (read-only or editable for current open period) ----
-
-interface PPPRowProps {
-  node: CadenceNode;
-  cycle: CadenceCycle;
-  editable: boolean;
-  onUpdateField?: (field: 'actuals' | 'nextPlan', value: string) => void;
-  statusLabel?: string; // e.g., "Overdue · March 1 – March 7"
-  // Owner editing
-  ownerEditable?: boolean;
-  onUpdateOwner?: (value: string) => void;
-  // Actions
-  isReviewed?: boolean;
-  onCompleteUpdate?: () => void;
-  onRetire?: () => void; // legacy (button removed)
-  onOpenMenu?: () => void;
+function uuid(): string {
+  return `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
-const PPPRow: React.FC<PPPRowProps> = ({
-  node,
-  cycle,
-  editable,
-  onUpdateField,
-  statusLabel,
-  ownerEditable,
-  onUpdateOwner,
-  isReviewed,
-  onCompleteUpdate,
-  onRetire,
-  onOpenMenu,
-}) => {
-  const labelPrefix = getNodeLabelPrefix(node.kind);
-  const baseLabel = `${labelPrefix}: ${node.name}`;
-  const objectLabel =
-    node.kind === 'task' && isReviewed ? `${baseLabel} ✅` : baseLabel;
+// ------------------------------
+// Hard rules
+// ------------------------------
 
-  const canEdit = editable && cycle.status === 'open' && !!onUpdateField;
-  const canEditOwner =
-    ownerEditable && cycle.status === 'open' && !!onUpdateOwner;
-
-  const periodText =
-    formatHumanDateRange(cycle.startDate, cycle.endDate) || '';
-
-  const effectiveStatusLine = (() => {
-    const owner = (cycle.owner || '').trim();
-    const parts: string[] = [];
-    if (owner) parts.push(`Owner: ${owner}`);
-    if (statusLabel) parts.push(statusLabel);
-    if (!statusLabel && periodText && !owner) parts.push(periodText);
-    return parts.join(' · ');
-  })();
-
-  return (
-    <View style={styles.pppRow}>
-      {/* Object + Owner/Status (owner optionally editable) */}
-      <View style={[styles.pppObjectCell, styles.fieldInputPast]}>
-        <Text style={[styles.pastFieldText, styles.pppObjectText]}>
-          {objectLabel}
-        </Text>
-        {canEditOwner ? (
-          <TextInput
-            style={[styles.ownerInlineInput, styles.editableOutlineInput]}
-            value={cycle.owner}
-            onChangeText={onUpdateOwner}
-            placeholder="Owner?"
-          />
-        ) : effectiveStatusLine ? (
-          <Text style={styles.ownerInline}>{effectiveStatusLine}</Text>
-        ) : null}
-      </View>
-
-      {/* Previous Plan (always read-only) */}
-      <View style={[styles.pppCell, styles.fieldInputPast]}>
-        <Text style={styles.pastFieldText}>
-          {cycle.previousPlan || '—'}
-        </Text>
-      </View>
-
-      {/* Actuals */}
-      <View style={[styles.pppCell, styles.fieldInputCurrentActuals, canEdit && styles.editableOutline]}>
-        {canEdit ? (
-          <TextInput
-            style={styles.pppTextInput}
-            value={cycle.actuals}
-            onChangeText={(text) => onUpdateField?.('actuals', text)}
-            multiline
-          />
-        ) : (
-          <Text style={styles.pastFieldText}>
-            {cycle.actuals || '—'}
-          </Text>
-        )}
-      </View>
-
-      {/* Next Plan */}
-      <View style={[styles.pppCell, styles.fieldInputCurrentNext, canEdit && styles.editableOutline]}>
-        {canEdit ? (
-          <TextInput
-            style={styles.pppTextInput}
-            value={cycle.nextPlan}
-            onChangeText={(text) => onUpdateField?.('nextPlan', text)}
-            multiline
-          />
-        ) : (
-          <Text style={styles.pastFieldText}>
-            {cycle.nextPlan || '—'}
-          </Text>
-        )}
-      </View>
-
-      {/* Actions cell (optional) */}
-      {(onCompleteUpdate || onOpenMenu) && (
-        <View style={styles.pppActionsCell}>
-          {onCompleteUpdate && (
-            <Pressable
-              disabled={isReviewed}
-              style={[
-                styles.completeUpdateButton,
-                isReviewed && styles.completeUpdateButtonDisabled,
-              ]}
-              onPress={onCompleteUpdate}
-            >
-              <Text
-                style={[
-                  styles.completeUpdateButtonText,
-                  isReviewed && styles.completeUpdateButtonTextDisabled,
-                ]}
-              >
-                {isReviewed ? 'Updated ✓' : 'Complete Update'}
-              </Text>
-            </Pressable>
-          )}
-
-          {onOpenMenu && (
-            <Pressable style={styles.kebabButton} onPress={onOpenMenu}>
-              <Text style={styles.kebabButtonText}>⋯</Text>
-            </Pressable>
-          )}
-        </View>
-      )}
-    </View>
-  );
-};
-
-// ---- Review Section (Review mode) ----
-
-interface ReviewSectionProps {
-  nodes: CadenceNode[];
-  activeProjectId?: string;
-  activeWorkstreamId?: string;
-  activeTaskId?: string;
-  onUpdateField: (
-    nodeId: string,
-    field: 'actuals' | 'nextPlan',
-    value: string
-  ) => void;
-  onUpdateOwner: (nodeId: string, value: string) => void;
-  onCompleteUpdateForNode: (nodeId: string) => void;
-  onRetireNode: (nodeId: string) => void;
-
-  // Global period completion
-  reviewCycleOffset: number;
-  onChangeReviewCycleOffset: (offset: number) => void;
-  onCompletePeriodForScope: (taskIds: string[]) => void;
-
-  // Task menu
-  onOpenTaskMenu: (taskId: string) => void;
+function isReorgAllowed(screen: Screen) {
+  return screen === 'manage';
+}
+function isOwnerAddAllowed(screen: Screen) {
+  return screen === 'owners';
+}
+function isOwnerEditAllowed(screen: Screen) {
+  return screen === 'owners';
+}
+function isMeetingActionsAllowed(screen: Screen) {
+  return screen === 'meeting';
 }
 
-// Visible cycle helper: 0 = latest, 1 = previous, etc.
-function getVisibleCycleForNode(
-  node: CadenceNode,
-  offset: number
-): CadenceCycle {
-  const sorted = node.cycles.slice().sort((a, b) => a.index - b.index);
-  const total = sorted.length;
-  if (total === 0) {
-    // should not happen, but fallback to a dummy cycle to avoid crashes
-    return {
-      id: `${node.id}-dummy`,
-      index: 0,
-      status: 'open',
-      previousPlan: '',
+// ------------------------------
+// Cycle engine
+// ------------------------------
+
+function ensureTaskCyclesUpTo(
+  task: Task,
+  ownerSnapshot: string,
+  cadence: Cadence,
+  firstStartISO: string,
+  targetIndex: number
+) {
+  const cycles = [...task.cycles].sort((a, b) => a.index - b.index);
+
+  for (let i = 0; i <= targetIndex; i++) {
+    const existing = cycles.find((c) => c.index === i);
+    if (existing) continue;
+
+    const start = cadenceIncrement(parseISODate(firstStartISO), cadence, i);
+    const next = cadenceIncrement(start, cadence, 1);
+    const end = addDays(next, -1);
+
+    const prev = i === 0 ? '' : safeTrim(cycles.find((c) => c.index === i - 1)?.nextPlan || '');
+
+    cycles.push({
+      index: i,
+      status: i === targetIndex ? 'open' : 'closed',
+      startDate: toISODate(start),
+      endDate: toISODate(end),
+      previousPlan: prev,
       actuals: '',
       nextPlan: '',
-      owner: '',
+      owner: ownerSnapshot,
       reviewed: false,
-    };
-  }
-  const clampedOffset = Math.min(offset, total - 1);
-  const visibleIdx = total - 1 - clampedOffset; // count from end
-  return sorted[visibleIdx];
-}
-
-const ReviewSection: React.FC<ReviewSectionProps> = ({
-  nodes,
-  activeProjectId,
-  activeWorkstreamId,
-  activeTaskId,
-  onUpdateField,
-  onUpdateOwner,
-  onCompleteUpdateForNode,
-  onRetireNode,
-  reviewCycleOffset,
-  onChangeReviewCycleOffset,
-  onCompletePeriodForScope,
-  onOpenTaskMenu,
-}) => {
-  const projects = getProjects(nodes);
-  const activeWs = nodes.find(
-    (n) => n.id === activeWorkstreamId && n.kind === 'workstream' && !n.retired
-  );
-  const reviewTitle = getCadenceReviewTitle(
-  activeWs?.cadence || 'weekly'
-);
-
-if (!activeWs) {
-  return (
-    <View style={styles.section}>
-      <Text style={styles.sectionTitle}>Review</Text>
-      <Text style={styles.cycleMetaSmall}>
-        Select a workstream to review.
-      </Text>
-    </View>
-  );
-}
-
-
-  if (projects.length === 0) {
-    return (
-      <View style={styles.section}>
-        <Text style={styles.sectionTitle}>{reviewTitle}</Text>
-        <Text style={styles.cycleMetaSmall}>
-          No projects defined yet.
-        </Text>
-      </View>
-    );
+    });
   }
 
-  // Determine scope based on active selections
-  const project =
-    activeProjectId &&
-    nodes.find(
-      (n) => n.id === activeProjectId && n.kind === 'project' && !n.retired
-    );
+  for (const c of cycles) c.status = c.index === targetIndex ? 'open' : 'closed';
 
-  const workstream =
-    activeWorkstreamId &&
-    nodes.find(
-      (n) =>
-        n.id === activeWorkstreamId &&
-        n.kind === 'workstream' &&
-        !n.retired
-    );
+  cycles.sort((a, b) => a.index - b.index);
+  for (let i = 1; i < cycles.length; i++) {
+    cycles[i].previousPlan = safeTrim(cycles[i - 1].nextPlan || '');
+  }
 
-  const task =
-    activeTaskId &&
-    nodes.find(
-      (n) => n.id === activeTaskId && n.kind === 'task' && !n.retired
-    );
+  return cycles;
+}
 
-  type RowNode = CadenceNode;
-  const rows: RowNode[] = [];
+// ------------------------------
+// Onboarding import (Option B)
+// ------------------------------
 
-  let scopeLabel = '';
-  let scopeOwnerLabel: string | undefined = undefined;
+function buildStateFromOnboarding(onb: OnboardingV1): AppState {
+  const today = new Date();
+  const todayISO = toISODate(today);
 
-  if (task) {
-    // Most specific: show just this Task
-    rows.push(task);
-    scopeLabel = `Task: ${task.name}`;
-  } else if (workstream) {
-    // All tasks under the selected workstream
-    const tasksUnderWS = getTasksForWorkstream(nodes, workstream.id);
-    rows.push(...tasksUnderWS);
-    scopeLabel = `Workstream: ${workstream.name}`;
+  const proj0 = onb.projects?.[0] || { name: 'My project', workstreams: [] };
+  const projectId = uuid();
 
-    // Derive owner(s) from tasks under this workstream
-    const ownerSet = new Set<string>();
-    tasksUnderWS.forEach((t) => {
-      if (!t.cycles || t.cycles.length === 0) return;
-      const c = getCurrentCycle(t);
-      const o = (c.owner || '').trim();
-      if (o) ownerSet.add(o);
+  const projects: Project[] = [{ id: projectId, name: safeTrim(proj0.name) || 'My project' }];
+
+  const workstreams: Workstream[] = [];
+  const tasks: Task[] = [];
+
+  for (const ws of proj0.workstreams || []) {
+    const cadence = (ws.cadence || 'weekly') as Cadence;
+    const firstCycleStartDate = toISODate(cadenceDefaultStart(today, cadence));
+
+    const wsId = uuid();
+    workstreams.push({
+      id: wsId,
+      projectId,
+      name: safeTrim(ws.name) || 'Workstream',
+      cadence,
+      firstCycleStartDate,
+
+      // ✅ capture milestone fields if present
+      lead: safeTrim(ws.lead || '') || undefined,
+      milestone: safeTrim(ws.milestone || '') || undefined,
+      milestoneDate: safeTrim(ws.milestoneDate || '') || undefined,
     });
 
-    if (ownerSet.size > 0) {
-      const owners = Array.from(ownerSet).sort();
-      scopeOwnerLabel =
-        owners.length === 1
-          ? `Owner: ${owners[0]}`
-          : `Owners: ${owners.join(', ')}`;
-    }
-  } else if (project) {
-    // All tasks under the selected project
-    const tasksUnderProj = getTasksForProject(nodes, project.id);
-    rows.push(...tasksUnderProj);
-    scopeLabel = `Project: ${project.name}`;
-  } else {
-    // No specific scope → all tasks in the system
-    const allTasks = getTasksForProject(nodes, undefined);
-    rows.push(...allTasks);
-    scopeLabel = 'All tasks';
-  }
-
-  if (rows.length === 0) {
-    return (
-      <View style={styles.section}>
-        <Text style={styles.sectionTitle}>{reviewTitle}</Text>
-        <Text style={styles.cycleMetaSmall}>
-          Nothing to review for current selection.
-        </Text>
-      </View>
-    );
-  }
-
-  // Navigation info based on the primary node (first row)
-  const primaryNode = rows[0];
-  const primarySortedCycles = primaryNode.cycles
-    .slice()
-    .sort((a, b) => a.index - b.index);
-  const totalCycles = primarySortedCycles.length;
-  const clampedOffset = Math.min(
-    reviewCycleOffset,
-    Math.max(totalCycles - 1, 0)
-  );
-  const visibleIdx = totalCycles - 1 - clampedOffset;
-  const visiblePrimaryCycle =
-    primarySortedCycles[Math.max(0, visibleIdx)] || primarySortedCycles[0];
-
-  // Header date ranges for Previous / Actuals / Next
-  const cadenceLabel = getCadenceLabel(primaryNode.cadence);
-  const nextRange = getNextPeriodRange(primaryNode, visiblePrimaryCycle);
-
-  // Actuals = visible period
-  const actualStart = visiblePrimaryCycle.startDate;
-  let actualEnd = visiblePrimaryCycle.endDate;
-  if (!actualEnd) {
-    const targetEnd = getTargetEndDate(primaryNode, visiblePrimaryCycle);
-    if (targetEnd) {
-      actualEnd = formatISODate(targetEnd);
+    for (const t of ws.tasks || []) {
+      const owner = safeTrim(t.owner || '') || 'Unassigned';
+      tasks.push({
+        id: uuid(),
+        workstreamId: wsId,
+        name: safeTrim(t.name) || 'Task',
+        owner,
+        lifecycle: 'active',
+        cycles: [],
+        createdAt: todayISO,
+      });
     }
   }
-  const actualRangeLabel = formatHumanDateRange(actualStart, actualEnd);
 
-  // Previous Plan = same period as Actuals
-  const previousRangeLabel = actualRangeLabel;
-
-  // Next Plan = next period range
-  const nextRangeLabel = nextRange
-    ? formatHumanDateRange(nextRange.start, nextRange.end)
-    : undefined;
-
-     // Simple label text for the top line
-  const nextPlanHeader = 'Next Plan';
-  const isCurrentPeriod = reviewCycleOffset === 0;
-  const editableTag = isCurrentPeriod ? 'Editable' : undefined;
-
-
-
-  const canGoPrev = clampedOffset < totalCycles - 1;
-  const canGoNext = clampedOffset > 0;
-
-  const handlePrev = () => {
-    if (!canGoPrev) return;
-    const nextOffset = Math.min(reviewCycleOffset + 1, totalCycles - 1);
-    onChangeReviewCycleOffset(nextOffset);
+  const selectedWorkstreamId = workstreams[0]?.id;
+  return {
+    projects,
+    workstreams,
+    tasks,
+    selectedProjectId: projectId,
+    selectedWorkstreamId,
   };
-
-  const handleNext = () => {
-    if (!canGoNext) return;
-    const nextOffset = Math.max(reviewCycleOffset - 1, 0);
-    onChangeReviewCycleOffset(nextOffset);
-  };
-
-  const handleLatest = () => {
-    if (reviewCycleOffset === 0) return;
-    onChangeReviewCycleOffset(0);
-  };
-
-  // Compute task-level review summary for current period
-  
-  const taskRows = rows.filter((n) => n.kind === 'task');
-  const openTaskCycles = isCurrentPeriod
-    ? taskRows.map((node) => {
-        const cycle = getVisibleCycleForNode(node, reviewCycleOffset);
-        return { node, cycle };
-      })
-    : [];
-  const openTaskCyclesFiltered = openTaskCycles.filter(
-    ({ cycle }) => cycle.status === 'open'
-  );
-
-  const totalOpenTasksInScope = openTaskCyclesFiltered.length;
-  const reviewedTasksInScope = openTaskCyclesFiltered.filter(
-    ({ cycle }) => !!cycle.reviewed
-  ).length;
-  const canCompletePeriod =
-    isCurrentPeriod &&
-    totalOpenTasksInScope > 0 &&
-    reviewedTasksInScope === totalOpenTasksInScope;
-
-  const handleCompletePeriodClick = () => {
-    const taskIds = openTaskCyclesFiltered.map(({ node }) => node.id);
-    if (taskIds.length > 0) {
-      onCompletePeriodForScope(taskIds);
-    }
-  };
-
-  return (
-    <View style={styles.section}>
-      <Text style={styles.sectionTitle}>{reviewTitle}</Text>
-      <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 4 }}>
-  <View style={[styles.selectorPill, styles.selectorPillActive]}>
-    <Text style={[styles.selectorPillText, styles.selectorPillTextActive]}>
-      {activeWs.name}
-    </Text>
-  </View>
-</View>
-
-      <Text style={styles.cycleMetaSmall}>
-        Scope: {scopeLabel || 'All'}
-      </Text>
-      {scopeOwnerLabel && (
-        <Text style={styles.cycleMetaSmall}>{scopeOwnerLabel}</Text>
-      )}
-
-      {isCurrentPeriod && (
-        <Text style={styles.cycleMetaSmall}>
-          {totalOpenTasksInScope === 0
-            ? 'No open tasks in this scope for the current period.'
-            : `${reviewedTasksInScope} of ${totalOpenTasksInScope} open tasks updated in this scope.`}
-        </Text>
-      )}
-
-      {/* Period navigation row */}
-      <View style={styles.cycleNavRow}>
-        {/* No more "Cycle N of N" – only navigation buttons */}
-        <View style={styles.cycleNavButtons}>
-          <Pressable
-            onPress={handlePrev}
-            disabled={!canGoPrev}
-            style={[
-              styles.cycleNavButton,
-              !canGoPrev && styles.cycleNavButtonDisabled,
-            ]}
-          >
-            <Text
-              style={[
-                styles.cycleNavButtonText,
-                !canGoPrev && styles.cycleNavButtonTextDisabled,
-              ]}
-            >
-              ◀ Prev
-            </Text>
-          </Pressable>
-          <Pressable
-            onPress={handleNext}
-            disabled={!canGoNext}
-            style={[
-              styles.cycleNavButton,
-              !canGoNext && styles.cycleNavButtonDisabled,
-            ]}
-          >
-            <Text
-              style={[
-                styles.cycleNavButtonText,
-                !canGoNext && styles.cycleNavButtonTextDisabled,
-              ]}
-            >
-              Next ▶
-            </Text>
-          </Pressable>
-          {clampedOffset > 0 && (
-            <Pressable
-              onPress={handleLatest}
-              style={styles.cycleNavButton}
-            >
-              <Text style={styles.cycleNavButtonText}>Latest</Text>
-            </Pressable>
-          )}
-        </View>
-      </View>
-
-           <PPPHeaderRow
-    nextPlanHeader={nextPlanHeader}
-    previousDateLabel={previousRangeLabel}
-    actualDateLabel={actualRangeLabel}
-    nextDateLabel={nextRangeLabel}
-    previousLocked={true}
-    actualEditable={isCurrentPeriod}
-    nextEditable={isCurrentPeriod}
-    showActions={isCurrentPeriod}
-  />
-
-
-
-      {rows.map((node) => {
-        const cycle = getVisibleCycleForNode(node, reviewCycleOffset);
-        const editable =
-          node.kind === 'task' &&
-          cycle.status === 'open' &&
-          reviewCycleOffset === 0;
-
-        const showActions = editable;
-
-        return (
-          <PPPRow
-            key={node.id}
-            node={node}
-            cycle={cycle}
-            editable={editable}
-            ownerEditable={editable}
-            onUpdateField={
-              editable
-                ? (field, value) => onUpdateField(node.id, field, value)
-                : undefined
-            }
-            onUpdateOwner={
-              editable ? (value) => onUpdateOwner(node.id, value) : undefined
-            }
-            isReviewed={!!cycle.reviewed}
-            onCompleteUpdate={
-              showActions
-                ? () => onCompleteUpdateForNode(node.id)
-                : undefined
-            }
-            onOpenMenu={showActions ? () => onOpenTaskMenu(node.id) : undefined}
-          />
-        );
-      })}
-
-      {/* Period-level completion footer */}
-      {isCurrentPeriod && (
-        <View style={styles.periodFooter}>
-          {totalOpenTasksInScope === 0 ? (
-            <Text style={styles.periodFooterText}>
-              No open tasks to complete for this period.
-            </Text>
-          ) : (
-            <Text style={styles.periodFooterText}>
-              When all tasks in this scope are updated, you can complete the period.
-            </Text>
-          )}
-          <Pressable
-            onPress={handleCompletePeriodClick}
-            disabled={!canCompletePeriod}
-            style={[
-              styles.completePeriodButton,
-              !canCompletePeriod && styles.completePeriodButtonDisabled,
-            ]}
-          >
-            <Text
-              style={[
-                styles.completePeriodButtonText,
-                !canCompletePeriod &&
-                  styles.completePeriodButtonTextDisabled,
-              ]}
-            >
-              Complete Period Update
-            </Text>
-          </Pressable>
-        </View>
-      )}
-    </View>
-  );
-};
-
-// ---- Owner overview (Owners mode) ----
-
-interface OwnersOverviewSectionProps {
-  summary?: OwnerSummary;
-  visibleNodeIds: string[];
-  onUpdateField: (
-    nodeId: string,
-    field: 'actuals' | 'nextPlan',
-    value: string
-  ) => void;
 }
 
-const OwnersOverviewSection: React.FC<OwnersOverviewSectionProps> = ({
-  summary,
-  visibleNodeIds,
-  onUpdateField,
-}) => {
-  if (!summary) {
-    return (
-      <View style={styles.section}>
-        <Text style={styles.sectionTitle}>Owner Overview</Text>
-        <Text style={styles.cycleMetaSmall}>
-          Select an owner to see their cadence items.
-        </Text>
-      </View>
-    );
-  }
+// ------------------------------
+// Small UI atoms
+// ------------------------------
 
-     const nextPlanHeader = 'Next Plan';
-  const visibleEntries = summary.entries.filter((e) =>
-    visibleNodeIds.includes(e.node.id)
-  );
-
-  const editableTag = 'Editable';
-
-  let previousDateLabel: string | undefined = undefined;
-  let actualDateLabel: string | undefined = undefined;
-  let nextDateLabel: string | undefined = undefined;
-
-  if (visibleEntries.length > 0) {
-    const starts: string[] = [];
-    const ends: string[] = [];
-
-    visibleEntries.forEach(({ node, cycle }) => {
-      if (cycle.startDate) {
-        starts.push(cycle.startDate);
-      }
-
-      let endStr = cycle.endDate;
-      if (!endStr) {
-        const targetEnd = getTargetEndDate(node, cycle);
-        if (targetEnd) {
-          endStr = formatISODate(targetEnd);
-        }
-      }
-      if (endStr) {
-        ends.push(endStr);
-      }
-    });
-
-    if (starts.length > 0 || ends.length > 0) {
-      const minStart = starts.length > 0 ? starts.sort()[0] : undefined;
-      const maxEnd =
-        ends.length > 0 ? ends.sort()[ends.length - 1] : undefined;
-
-      const rangeLabel = formatHumanDateRange(minStart, maxEnd);
-
-      actualDateLabel = rangeLabel;
-      previousDateLabel = rangeLabel;
-      nextDateLabel = rangeLabel;
-    }
-  }
-
-
-  // Derive date labels from the first visible entry (similar to ReviewSection)
-  let previousRangeLabel: string | undefined;
-  let actualRangeLabel: string | undefined;
-  let nextRangeLabel: string | undefined;
-
-  if (visibleEntries.length > 0) {
-    const primaryNode = visibleEntries[0].node;
-    const primaryCycle = visibleEntries[0].cycle;
-
-    const nextRange = getNextPeriodRange(primaryNode, primaryCycle);
-
-    const actualStart = primaryCycle.startDate;
-    let actualEnd = primaryCycle.endDate;
-    if (!actualEnd) {
-      const targetEnd = getTargetEndDate(primaryNode, primaryCycle);
-      if (targetEnd) {
-        actualEnd = formatISODate(targetEnd);
-      }
-    }
-
-    actualRangeLabel = formatHumanDateRange(actualStart, actualEnd);
-    previousRangeLabel = actualRangeLabel;
-    nextRangeLabel = nextRange
-      ? formatHumanDateRange(nextRange.start, nextRange.end)
-      : undefined;
-  }
-
-  return (
-    <View style={styles.section}>
-      <Text style={styles.sectionTitle}>
-  Tasks owned by {summary.owner}
-</Text>
-
-
-      {visibleEntries.length === 0 ? (
-        <Text style={styles.cycleMetaSmall}>
-          No items selected for this owner. Use the gold-highlighted
-          project/workstream/task pills to toggle visibility.
-        </Text>
-      ) : (
-        <>
-                     <PPPHeaderRow
-    nextPlanHeader={nextPlanHeader}
-    previousDateLabel={previousDateLabel}  // if you already compute these
-    actualDateLabel={actualDateLabel}
-    nextDateLabel={nextDateLabel}
-    previousLocked={true}
-    actualEditable={true}
-    nextEditable={true}
-  />
-
-
-          {visibleEntries.map(({ node, cycle }) => (
-            <PPPRow
-              key={node.id}
-              node={node}
-              cycle={cycle}
-              editable={cycle.status === 'open'}
-              onUpdateField={(field, value) =>
-                onUpdateField(node.id, field, value)
-              }
-            />
-          ))}
-        </>
-      )}
-    </View>
-  );
-};
-
-
-// ---- Open mode section (All open periods) ----
-
-interface OpenEntry {
-  node: CadenceNode;
-  cycle: CadenceCycle;
-  dueState: DueState;
-  targetEnd?: Date;
-}
-
-interface OpenModeSectionProps {
-  entries: OpenEntry[];
-  onUpdateField: (
-    nodeId: string,
-    field: 'actuals' | 'nextPlan',
-    value: string
-  ) => void;
-  onUpdateOwner: (nodeId: string, value: string) => void;
-  onCompleteUpdateForNode: (nodeId: string) => void;
-  onRetireNode: (nodeId: string) => void;
-  // Task menu
-  onOpenTaskMenu: (taskId: string) => void;
-}
-
-const OpenModeSection: React.FC<OpenModeSectionProps> = ({
-  entries,
-  onUpdateField,
-  onUpdateOwner,
-  onCompleteUpdateForNode,
-  onRetireNode,
-  onOpenTaskMenu,
-}) => {
-  const dueLabel = (state: DueState): string =>
-    state === 'overdue'
-      ? 'Overdue'
-      : state === 'duesoon'
-      ? 'Due soon'
-      : 'On time';
-
-  const nextPlanHeader = 'Next Plan (current open periods)';
-
-  if (entries.length === 0) {
-    return (
-      <View style={styles.section}>
-        <Text style={styles.sectionTitle}>Open Periods</Text>
-        <Text style={styles.cycleMetaSmall}>
-          No open periods match the current filters.
-        </Text>
-      </View>
-    );
-  }
-
-  return (
-    <View style={styles.section}>
-      <Text style={styles.sectionTitle}>Open Periods</Text>
-      <Text style={styles.cycleMetaSmall}>
-        Showing {entries.length} open period
-        {entries.length === 1 ? '' : 's'}.
-      </Text>
-
-      <PPPHeaderRow nextPlanHeader={nextPlanHeader} showActions />
-
-      {entries.map(({ node, cycle, dueState }) => {
-        const periodText =
-          formatHumanDateRange(cycle.startDate, cycle.endDate) || '';
-
-        const statusLabel = periodText
-          ? `${dueLabel(dueState)} · ${periodText}`
-          : dueLabel(dueState);
-
-        return (
-          <PPPRow
-            key={node.id}
-            node={node}
-            cycle={cycle}
-            editable={cycle.status === 'open'}
-            ownerEditable={true}
-            onUpdateField={(field, value) =>
-              onUpdateField(node.id, field, value)
-            }
-            onUpdateOwner={(value) => onUpdateOwner(node.id, value)}
-            statusLabel={statusLabel}
-            isReviewed={!!cycle.reviewed}
-            onCompleteUpdate={() => onCompleteUpdateForNode(node.id)}
-            onOpenMenu={() => onOpenTaskMenu(node.id)}
-          />
-        );
-      })}
-    </View>
-  );
-};
-
-// ---- Pill components ----
-
-interface PillProps {
-  label: string;
-  active: boolean;
-  onPress: () => void;
-}
-
-// Mode pills (Review / Owners / Open) – pink active
-const ModePill: React.FC<PillProps> = ({ label, active, onPress }) => (
-  <Pressable
-    onPress={onPress}
-    style={[styles.modePill, active && styles.modePillActive]}
-  >
-    <Text style={[styles.modePillText, active && styles.modePillTextActive]}>
-      {label}
-    </Text>
-  </Pressable>
-);
-
-// Owner / filter pills
-const OwnerPill: React.FC<PillProps> = ({ label, active, onPress }) => (
-  <Pressable
-    onPress={onPress}
-    style={[styles.ownerPill, active && styles.ownerPillActive]}
-  >
-    <Text
-      style={[styles.ownerPillText, active && styles.ownerPillTextActive]}
-    >
-      {label}
-    </Text>
-  </Pressable>
-);
-
-interface SelectorPillProps {
-  label: string;
-  active: boolean;
-  highlighted?: boolean; // gold border when owner owns this node (directly or via descendants)
-  disabled?: boolean;
-  onPress: () => void;
-}
-
-// Selector pills – green active, gold outline when highlighted in Owners view
-const SelectorPill: React.FC<SelectorPillProps> = ({
+function Pill({
   label,
   active,
-  highlighted,
-  disabled,
   onPress,
-}) => {
-  const handlePress = () => {
-    if (disabled) return;
-    onPress();
-  };
-
+}: {
+  label: string;
+  active?: boolean;
+  onPress?: () => void;
+}) {
   return (
-    <Pressable
-      onPress={handlePress}
-      style={[
-        styles.selectorPill,
-        active && styles.selectorPillActive,
-        highlighted && styles.selectorPillHighlighted,
-        disabled && styles.selectorPillDisabled,
-      ]}
-    >
-      <Text
-        style={[
-          styles.selectorPillText,
-          active && styles.selectorPillTextActive,
-          disabled && styles.selectorPillTextDisabled,
-        ]}
-      >
+    <Pressable onPress={onPress} style={[styles.pill, active ? styles.pillActive : styles.pillInactive]}>
+      <Text style={[styles.pillText, active ? styles.pillTextActive : styles.pillTextInactive]}>
         {label}
       </Text>
     </Pressable>
   );
-};
-
-// ---- ID helper ----
-
-function generateNodeId(kind: CadenceKind): string {
-  return `${kind}-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
 }
 
-// ---- Main App ----
+function Card({ children }: { children: React.ReactNode }) {
+  return <View style={styles.card}>{children}</View>;
+}
 
-const STORAGE_KEY = 'cadence-app-state-v1';
+function SectionTitle({ title, right }: { title: string; right?: React.ReactNode }) {
+  return (
+    <View style={styles.sectionHeader}>
+      <Text style={styles.sectionTitle}>{title}</Text>
+      {right ? <View>{right}</View> : null}
+    </View>
+  );
+}
+
+function SmallMuted({ children }: { children: React.ReactNode }) {
+  return <Text style={styles.smallMuted}>{children}</Text>;
+}
+
+// ------------------------------
+// App
+// ------------------------------
 
 export default function App() {
-  const [state, setState] = useState<AppState>(initialState);
-  const [isHydrated, setIsHydrated] = useState(false);
+  const [state, setState] = useState<AppState | null>(null);
+  const [screen, setScreen] = useState<Screen>('meeting'); // default Meeting
+  const [cycleOffset, setCycleOffset] = useState<number>(0);
+  const [loading, setLoading] = useState(true);
 
-  // global cycle offset for Review view (0 = latest)
-  const [reviewCycleOffset, setReviewCycleOffset] = useState(0);
-
-  // Help overlay toggle
-  const [showHelp, setShowHelp] = useState(false);
-
-  // Advanced toggle
-  const [showAdvanced, setShowAdvanced] = useState(false);
-
-  // Stage 0 SetupScreen toggle (not persisted yet – MVP)
-  const [showSetup, setShowSetup] = useState(true);
-
-  // Backup / restore UI state
-  const [backupExportText, setBackupExportText] = useState('');
-  const [backupImportText, setBackupImportText] = useState('');
-  const [backupError, setBackupError] = useState<string | null>(null);
-  const [backupInfo, setBackupInfo] = useState<string | null>(null);
-
-  // Task actions (kebab menu / modal)
-  const [taskMenuTaskId, setTaskMenuTaskId] = useState<string | null>(null);
-  const [taskMenuDraftName, setTaskMenuDraftName] = useState('');
-
-  // Workstream actions (header kebab / modal)
-  const [workstreamMenuWsId, setWorkstreamMenuWsId] = useState<string | null>(null);
-  const [workstreamMenuDraftCadence, setWorkstreamMenuDraftCadence] =
-    useState<CadenceType>('weekly');
-
-  // ---- Task menu helpers ----
-  function onOpenTaskMenu(taskId: string) {
-    const node = state.nodes.find((n) => n.id === taskId && n.kind === 'task');
-    if (!node) return;
-    setTaskMenuTaskId(taskId);
-    setTaskMenuDraftName(node.name || '');
-      }
-
-  function closeTaskMenu() {
-    setTaskMenuTaskId(null);
-  }
-
-  function onOpenWorkstreamMenu(workstreamId: string) {
-    const ws = state.nodes.find((n) => n.id === workstreamId && n.kind === 'workstream');
-    if (!ws) return;
-    setWorkstreamMenuWsId(workstreamId);
-    // default to current cadence, but if a pending cadence exists, show that as the selection
-    setWorkstreamMenuDraftCadence((ws.pendingCadence as any) || ws.cadence || 'weekly');
-  }
-
-  function closeWorkstreamMenu() {
-    setWorkstreamMenuWsId(null);
-  }
-
-
-  // Inactive tasks list toggle (per-scope section)
-  const [showInactiveTasks, setShowInactiveTasks] = useState(false);
-
-  // Create-new local UI state
-  const [isCreatingProject, setIsCreatingProject] = useState(false);
-  const [newProjectName, setNewProjectName] = useState('');
-
-  const [isCreatingWorkstream, setIsCreatingWorkstream] = useState(false);
-  const [newWorkstreamName, setNewWorkstreamName] = useState('');
-  const [newWorkstreamCadence, setNewWorkstreamCadence] =
-    useState<CadenceType>('weekly');
-
-  const [isCreatingTask, setIsCreatingTask] = useState(false);
   const [newTaskName, setNewTaskName] = useState('');
   const [newTaskOwner, setNewTaskOwner] = useState('');
-  const [milestonePickerWsId, setMilestonePickerWsId] = useState<string | null>(null);
-  const [milestonePickerDate, setMilestonePickerDate] = useState<Date | null>(null);
 
-  // Load persisted state on mount
-  useEffect(() => {
-    const loadState = async () => {
-      try {
-        const stored = await AsyncStorage.getItem(STORAGE_KEY);
-        if (stored) {
-          const parsed: AppState = JSON.parse(stored);
-          setState(parsed);
-        }
-      } catch (err) {
-        console.error('Failed to load Cadence state:', err);
-      } finally {
-        setIsHydrated(true);
-      }
-    };
-
-    loadState();
-  }, []);
-
-  const handleSetupComplete = (data: any) => {
-  const nowStr = formatISODate(new Date());
-
-  const isOnboardingV1 =
-    !!data &&
-    typeof data === 'object' &&
-    data.version === 1 &&
-    Array.isArray(data.projects);
-
-  // Helper: build nodes from a single project payload
-  const buildFromSingleProject = (projectName: string, workstreams: any[]) => {
-    const projectId = generateNodeId('project');
-
-    const projectNode: CadenceNode = {
-      id: projectId,
-      kind: 'project',
-      name: projectName || 'My first cadence project',
-      cadence: 'weekly',
-      cycles: [],
-    };
-
-    const workstreamNodes: CadenceNode[] = [];
-    const taskNodes: CadenceNode[] = [];
-
-    (workstreams || []).forEach((ws) => {
-      const wsId = generateNodeId('workstream');
-      const wsCadence: CadenceType = (ws?.cadence as CadenceType) || 'weekly';
-
-      const wsNode: CadenceNode = {
-        id: wsId,
-        kind: 'workstream',
-        parentId: projectId,
-        name: ws?.name || 'Workstream',
-        cadence: wsCadence,
-        cycles: [],
-      };
-      workstreamNodes.push(wsNode);
-
-      (ws?.tasks || []).forEach((task: any) => {
-        const taskId = generateNodeId('task');
-
-        const firstCycle: CadenceCycle = {
-          id: `${taskId}-period-1`,
-          index: 0,
-          status: 'open',
-          startDate: nowStr,
-          previousPlan: '',
-          actuals: '',
-          nextPlan: '',
-          owner: String(task?.owner || '').trim(),
-          reviewed: false,
-        };
-
-        const taskNode: CadenceNode = {
-          id: taskId,
-          kind: 'task',
-          parentId: wsId,
-          name: task?.name || 'Task',
-          cadence: wsCadence, // ✅ tasks inherit from workstream
-          cycles: [firstCycle],
-        };
-
-        taskNodes.push(taskNode);
-      });
-    });
-
-    const allNodes = [projectNode, ...workstreamNodes, ...taskNodes];
-
-    setState((prev) => ({
-      ...prev,
-      nodes: allNodes,
-      activeProjectId: projectId,
-      activeWorkstreamId: workstreamNodes[0]?.id,
-      activeTaskId: taskNodes[0]?.id,
-      viewMode: 'review',
-    }));
-
-    setReviewCycleOffset(0);
-  };
-
-  if (isOnboardingV1) {
-    const onboarding = data as OnboardingV1;
-
-    // MVP: import only the first project (keeps UI simple)
-    const p0 = onboarding.projects[0];
-    buildFromSingleProject(p0?.name || 'Imported project', p0?.workstreams || []);
-    return;
-  }
-
-  // Fallback: existing demo/setup shape
-  const legacy = data as SetupResult;
-  buildFromSingleProject(legacy.projectName, legacy.workstreams);
-};
-
-
-  // If we already have nodes from a previous run, skip SetupScreen
-  useEffect(() => {
-    if (isHydrated && state.nodes.length > 0) {
-      setShowSetup(false);
-    }
-  }, [isHydrated, state.nodes.length]);
-
-  // Persist state whenever it changes (after hydration)
-  useEffect(() => {
-    if (!isHydrated) return; // prevent overwriting before load finishes
-
-    const saveState = async () => {
-      try {
-        await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-      } catch (err) {
-        console.error('Failed to save Cadence state:', err);
-      }
-    };
-    saveState();
-  }, [state, isHydrated]);
-
-  const inOwnersMode = state.viewMode === 'owners';
-  const inReviewMode = state.viewMode === 'review';
-
-  const projects = getProjects(state.nodes);
-
-  // Workstreams visibility:
-  const workstreams = inOwnersMode
-    ? getAllWorkstreams(state.nodes)
-    : state.activeProjectId
-    ? getWorkstreamsForProject(state.nodes, state.activeProjectId)
-    : getAllWorkstreams(state.nodes);
-
-  // Tasks visibility:
-  const allScopeTasks = inOwnersMode
-    ? state.nodes.filter((n) => n.kind === 'task')
-    : state.activeWorkstreamId
-    ? getTasksForWorkstream(state.nodes, state.activeWorkstreamId)
-    : state.activeProjectId
-    ? getTasksForProject(state.nodes, state.activeProjectId)
-    : state.nodes.filter((n) => n.kind === 'task');
-
-  const tasks = allScopeTasks.filter((t) => !t.retired);
-  const inactiveTasks = allScopeTasks.filter((t) => !!t.retired);
-
-  const taskMenuNode =
-    taskMenuTaskId ? state.nodes.find((n) => n.id === taskMenuTaskId) : null;
-
-  const workstreamMenuNode =
-    workstreamMenuWsId ? state.nodes.find((n) => n.id === workstreamMenuWsId) : null;
-
-  const ownerSummaries = getOwnerSummaries(state.nodes);
-  const activeOwnerSummary = ownerSummaries.find(
-    (s) => s.owner === state.activeOwner
+  // Manage drafts
+  const [manageDraftProjectName, setManageDraftProjectName] = useState('');
+  const [manageDraftWorkstreamName, setManageDraftWorkstreamName] = useState('');
+  const [manageDraftWorkstreamCadence, setManageDraftWorkstreamCadence] = useState<Cadence>('weekly');
+  const [manageDraftFirstCycleStart, setManageDraftFirstCycleStart] = useState(
+    toISODate(startOfWeekMonday(new Date()))
   );
 
-  // Show a tiny loading state while hydrating from AsyncStorage
-  if (!isHydrated) {
+  // ✅ if no persisted state, show SetupScreen
+  const [needsSetup, setNeedsSetup] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const raw = await AsyncStorage.getItem(STORAGE_KEY);
+        if (!raw) {
+          setNeedsSetup(true);
+          setState(null);
+        } else {
+          setState(JSON.parse(raw));
+        }
+      } catch {
+        setNeedsSetup(true);
+        setState(null);
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!state) return;
+    AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(state)).catch(() => {});
+  }, [state]);
+
+  const todayISO = useMemo(() => toISODate(new Date()), []);
+
+  const selectedProject = useMemo(() => {
+    if (!state?.selectedProjectId) return undefined;
+    return state.projects.find((p) => p.id === state.selectedProjectId);
+  }, [state]);
+
+  const selectedWorkstream = useMemo(() => {
+    if (!state?.selectedWorkstreamId) return undefined;
+    return state.workstreams.find((w) => w.id === state.selectedWorkstreamId);
+  }, [state]);
+
+  const workstreamsInProject = useMemo(() => {
+    if (!state?.selectedProjectId) return [];
+    return state.workstreams.filter((w) => w.projectId === state.selectedProjectId);
+  }, [state]);
+
+  const tasksInSelectedWorkstream = useMemo(() => {
+    if (!state?.selectedWorkstreamId) return [];
+    return state.tasks
+      .filter((t) => t.workstreamId === state.selectedWorkstreamId)
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }, [state]);
+
+  const cycleInfo = useMemo(() => {
+    if (!selectedWorkstream) return null;
+    return getCycleForDate(todayISO, selectedWorkstream.firstCycleStartDate, selectedWorkstream.cadence);
+  }, [selectedWorkstream, todayISO]);
+
+  const viewedCycleIndex = useMemo(() => {
+    if (!cycleInfo) return 0;
+    return Math.max(0, cycleInfo.currentIndex - cycleOffset);
+  }, [cycleInfo, cycleOffset]);
+
+  const viewedPeriodLabel = useMemo(() => {
+    if (!selectedWorkstream || !cycleInfo) return '';
+    const cadence = selectedWorkstream.cadence;
+    const start = cadenceIncrement(parseISODate(selectedWorkstream.firstCycleStartDate), cadence, viewedCycleIndex);
+    const next = cadenceIncrement(start, cadence, 1);
+    const end = addDays(next, -1);
+    return `${formatHumanDate(toISODate(start))} – ${formatHumanDate(toISODate(end))}`;
+  }, [selectedWorkstream, cycleInfo, viewedCycleIndex]);
+
+  // Ensure tasks have cycles up to current index
+  useEffect(() => {
+    if (!state || !selectedWorkstream || !cycleInfo) return;
+    const currentIndex = cycleInfo.currentIndex;
+
+    let changed = false;
+    const newTasks = state.tasks.map((t) => {
+      if (t.workstreamId !== selectedWorkstream.id) return t;
+      const maxIdx = t.cycles.reduce((m, c) => Math.max(m, c.index), -1);
+      if (maxIdx >= currentIndex) return t;
+
+      changed = true;
+      return {
+        ...t,
+        cycles: ensureTaskCyclesUpTo(t, t.owner, selectedWorkstream.cadence, selectedWorkstream.firstCycleStartDate, currentIndex),
+      };
+    });
+
+    if (changed) setState({ ...state, tasks: newTasks });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state?.tasks?.length, selectedWorkstream?.id, cycleInfo?.currentIndex]);
+
+  const viewedTasks = useMemo(() => {
+    if (!selectedWorkstream) return [];
+    return tasksInSelectedWorkstream.map((t) => {
+      const cyc = t.cycles.find((c) => c.index === viewedCycleIndex);
+      return { task: t, cycle: cyc };
+    });
+  }, [tasksInSelectedWorkstream, selectedWorkstream, viewedCycleIndex]);
+
+  const activeViewed = useMemo(() => viewedTasks.filter((x) => x.task.lifecycle === 'active'), [viewedTasks]);
+
+  const readiness = useMemo(() => {
+    if (cycleOffset !== 0) return null;
+    const total = activeViewed.length;
+    const prepared = activeViewed.filter(
+      (x) => safeTrim(x.cycle?.actuals || '').length > 0 && safeTrim(x.cycle?.nextPlan || '').length > 0
+    ).length;
+    return { total, prepared, missing: total - prepared };
+  }, [activeViewed, cycleOffset]);
+
+  const allReviewedCurrent = useMemo(() => {
+    if (cycleOffset !== 0) return false;
+    if (activeViewed.length === 0) return false;
+    return activeViewed.every((x) => x.cycle?.reviewed === true);
+  }, [activeViewed, cycleOffset]);
+
+  const canClosePeriod = useMemo(() => {
+    return isMeetingActionsAllowed(screen) && cycleOffset === 0 && allReviewedCurrent;
+  }, [screen, cycleOffset, allReviewedCurrent]);
+
+  // ------------------------------
+  // Setup completion
+  // ------------------------------
+
+  function handleSetupComplete(onb: OnboardingV1) {
+    const next = buildStateFromOnboarding(onb);
+    setState(next);
+    setNeedsSetup(false);
+    setScreen('meeting');
+    setCycleOffset(0);
+  }
+
+  // ------------------------------
+  // Mutations
+  // ------------------------------
+
+  function setSelectedProject(projectId: string) {
+    if (!state) return;
+    const ws = state.workstreams.find((w) => w.projectId === projectId);
+    setState({ ...state, selectedProjectId: projectId, selectedWorkstreamId: ws ? ws.id : undefined });
+    setCycleOffset(0);
+  }
+
+  function setSelectedWorkstream(workstreamId: string) {
+    if (!state) return;
+    setState({ ...state, selectedWorkstreamId: workstreamId });
+    setCycleOffset(0);
+  }
+
+  function updateCycleField(taskId: string, cycleIndex: number, patch: Partial<Cycle>) {
+    if (!state) return;
+    const newTasks = state.tasks.map((t) => {
+      if (t.id !== taskId) return t;
+      const cycles = (t.cycles || []).map((c) => (c.index !== cycleIndex ? c : { ...c, ...patch }));
+      cycles.sort((a, b) => a.index - b.index);
+      for (let i = 1; i < cycles.length; i++) cycles[i].previousPlan = safeTrim(cycles[i - 1].nextPlan || '');
+      return { ...t, cycles };
+    });
+    setState({ ...state, tasks: newTasks });
+  }
+
+  function addTaskOwnerPrep() {
+    if (!state || !selectedWorkstream) return;
+    if (!isOwnerAddAllowed(screen)) return;
+
+    const name = safeTrim(newTaskName);
+    const owner = safeTrim(newTaskOwner) || 'Unassigned';
+    if (!name) return;
+
+    const today = toISODate(new Date());
+    const task: Task = {
+      id: uuid(),
+      workstreamId: selectedWorkstream.id,
+      name,
+      owner,
+      lifecycle: 'active',
+      cycles: [],
+      createdAt: today,
+    };
+
+    if (cycleInfo) {
+      task.cycles = ensureTaskCyclesUpTo(
+        task,
+        owner,
+        selectedWorkstream.cadence,
+        selectedWorkstream.firstCycleStartDate,
+        cycleInfo.currentIndex
+      );
+    }
+
+    setState({ ...state, tasks: [...state.tasks, task] });
+    setNewTaskName('');
+    setNewTaskOwner('');
+  }
+
+  function captureFollowUpInMeeting() {
+    if (!state || !selectedWorkstream || !cycleInfo) return;
+    if (!isMeetingActionsAllowed(screen)) return;
+
+    Alert.prompt?.(
+      'Capture follow-up',
+      'Enter an action item (it will start next period).',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Add',
+          onPress: (text?: string) => {
+
+            const name = safeTrim(text || '');
+            if (!name) return;
+
+            const nextIndex = cycleInfo.currentIndex + 1;
+            const owner = 'Unassigned';
+
+            const task: Task = {
+              id: uuid(),
+              workstreamId: selectedWorkstream.id,
+              name,
+              owner,
+              lifecycle: 'active',
+              cycles: [],
+              createdAt: toISODate(new Date()),
+            };
+            task.cycles = ensureTaskCyclesUpTo(
+              task,
+              owner,
+              selectedWorkstream.cadence,
+              selectedWorkstream.firstCycleStartDate,
+              nextIndex
+            );
+            setState({ ...state, tasks: [...state.tasks, task] });
+          },
+        },
+      ],
+      'plain-text'
+    );
+
+    if (Platform.OS === 'android') {
+      Alert.alert('Capture follow-up', 'On Android, please add follow-ups in Owners view for now.');
+    }
+  }
+
+  function closeCurrentPeriod() {
+    if (!state || !selectedWorkstream || !cycleInfo) return;
+    if (!canClosePeriod) return;
+
+    const nextIndex = cycleInfo.currentIndex + 1;
+    const updatedTasks = state.tasks.map((t) => {
+      if (t.workstreamId !== selectedWorkstream.id) return t;
+      if (t.lifecycle !== 'active') return t;
+      const cycles = ensureTaskCyclesUpTo(
+        t,
+        t.owner,
+        selectedWorkstream.cadence,
+        selectedWorkstream.firstCycleStartDate,
+        nextIndex
+      );
+      return { ...t, cycles };
+    });
+
+    setState({ ...state, tasks: updatedTasks });
+    Alert.alert('Period closed', 'Opened the next period for this workstream.');
+    setCycleOffset(0);
+  }
+
+  // ------------------------------
+  // Manage actions (reorg-only)
+  // ------------------------------
+
+  function manageCreateProject() {
+    if (!state) return;
+    if (!isReorgAllowed(screen)) return;
+
+    const name = safeTrim(manageDraftProjectName);
+    if (!name) return;
+
+    const p: Project = { id: uuid(), name };
+    setState({ ...state, projects: [...state.projects, p], selectedProjectId: p.id, selectedWorkstreamId: undefined });
+    setManageDraftProjectName('');
+  }
+
+  function manageCreateWorkstream() {
+    if (!state || !state.selectedProjectId) return;
+    if (!isReorgAllowed(screen)) return;
+
+    const name = safeTrim(manageDraftWorkstreamName);
+    if (!name) return;
+
+    const ws: Workstream = {
+      id: uuid(),
+      projectId: state.selectedProjectId,
+      name,
+      cadence: manageDraftWorkstreamCadence,
+      firstCycleStartDate: manageDraftFirstCycleStart,
+    };
+
+    setState({ ...state, workstreams: [...state.workstreams, ws], selectedWorkstreamId: ws.id });
+    setManageDraftWorkstreamName('');
+  }
+
+  function manageRenameTask(taskId: string, newName: string) {
+    if (!state) return;
+    if (!isReorgAllowed(screen)) return;
+    const name = safeTrim(newName);
+    if (!name) return;
+    setState({ ...state, tasks: state.tasks.map((t) => (t.id === taskId ? { ...t, name } : t)) });
+  }
+
+  function manageChangeOwner(taskId: string, owner: string) {
+    if (!state) return;
+    if (!isReorgAllowed(screen)) return;
+    setState({
+      ...state,
+      tasks: state.tasks.map((t) => (t.id === taskId ? { ...t, owner: safeTrim(owner) || 'Unassigned' } : t)),
+    });
+  }
+
+  function manageRetireTask(taskId: string) {
+    if (!state) return;
+    if (!isReorgAllowed(screen)) return;
+    setState({ ...state, tasks: state.tasks.map((t) => (t.id === taskId ? { ...t, lifecycle: 'inactive' } : t)) });
+  }
+
+  function manageReactivateTask(taskId: string) {
+    if (!state) return;
+    if (!isReorgAllowed(screen)) return;
+    setState({ ...state, tasks: state.tasks.map((t) => (t.id === taskId ? { ...t, lifecycle: 'active' } : t)) });
+  }
+
+  async function manageResetToSetup() {
+    if (!isReorgAllowed(screen)) return;
+    await AsyncStorage.removeItem(STORAGE_KEY);
+    setState(null);
+    setNeedsSetup(true);
+  }
+
+  // ------------------------------
+  // Render helpers
+  // ------------------------------
+
+  function renderTopNav() {
     return (
-      <SafeAreaView style={styles.safeArea}>
-        <View style={[styles.scrollContent, { justifyContent: 'center' }]}>
-          <Text style={styles.appTitle}>Cadence v2 Prototype</Text>
-          <Text style={styles.nodeSubtitle}>Loading your cadence…</Text>
+      <View style={styles.topNav}>
+        <View style={styles.topNavRow}>
+          <Text style={styles.appTitle}>Cadence</Text>
+          <View style={styles.topNavPills}>
+            <Pill label="Meeting" active={screen === 'meeting'} onPress={() => setScreen('meeting')} />
+            <Pill label="Owners" active={screen === 'owners'} onPress={() => setScreen('owners')} />
+            <Pill label="Manage" active={screen === 'manage'} onPress={() => setScreen('manage')} />
+          </View>
         </View>
-      </SafeAreaView>
+
+        <View style={styles.scopeRow}>
+          <View style={styles.scopeBlock}>
+            <SmallMuted>Project</SmallMuted>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+              <View style={styles.inlineRow}>
+                {state?.projects.map((p) => (
+                  <Pill
+                    key={p.id}
+                    label={p.name}
+                    active={p.id === state?.selectedProjectId}
+                    onPress={() => setSelectedProject(p.id)}
+                  />
+                ))}
+              </View>
+            </ScrollView>
+          </View>
+
+          <View style={styles.scopeBlock}>
+            <SmallMuted>Workstream</SmallMuted>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+              <View style={styles.inlineRow}>
+                {workstreamsInProject.map((w) => (
+                  <Pill
+                    key={w.id}
+                    label={w.name}
+                    active={w.id === state?.selectedWorkstreamId}
+                    onPress={() => setSelectedWorkstream(w.id)}
+                  />
+                ))}
+              </View>
+            </ScrollView>
+          </View>
+        </View>
+      </View>
     );
   }
-  // Show tiny loading state while hydrating from AsyncStorage
-  if (!isHydrated) {
+
+  function renderPeriodNavigator() {
+    if (!selectedWorkstream || !cycleInfo) return null;
+
+    const canGoBack = viewedCycleIndex > 0;
+    const canGoForward = cycleOffset > 0;
+
     return (
-      <SafeAreaView style={styles.safeArea}>
-        <View style={[styles.scrollContent, { justifyContent: 'center' }]}>
-          <Text style={styles.appTitle}>Cadence v2 Prototype</Text>
-          <Text style={styles.nodeSubtitle}>Loading your cadence…</Text>
+      <View style={styles.periodNav}>
+        <Pressable
+          style={[styles.navBtn, !canGoBack ? styles.navBtnDisabled : null]}
+          disabled={!canGoBack}
+          onPress={() => setCycleOffset((x) => x + 1)}
+        >
+          <Text style={styles.navBtnText}>◀</Text>
+        </Pressable>
+
+        <View style={styles.periodCenter}>
+          <Text style={styles.periodTitle}>
+            {screen === 'meeting' ? 'Weekly Cadence Meeting' : screen === 'owners' ? 'Owner Prep' : 'Manage (Backstage)'}
+          </Text>
+          <Text style={styles.periodSub}>{viewedPeriodLabel}</Text>
+
+          {/* ✅ show milestone context if present */}
+          {selectedWorkstream.milestone ? (
+            <Text style={styles.periodHint}>
+              Milestone: {selectedWorkstream.milestone}
+              {selectedWorkstream.milestoneDate ? ` (by ${selectedWorkstream.milestoneDate})` : ''}
+            </Text>
+          ) : null}
+
+          {screen === 'meeting' && cycleOffset === 0 ? (
+            <Text style={styles.periodHint}>Expectation: task owners update before the meeting.</Text>
+          ) : null}
+          {cycleOffset > 0 ? <Text style={styles.periodHint}>Past period (read-only)</Text> : null}
+        </View>
+
+        <Pressable
+          style={[styles.navBtn, !canGoForward ? styles.navBtnDisabled : null]}
+          disabled={!canGoForward}
+          onPress={() => setCycleOffset((x) => Math.max(0, x - 1))}
+        >
+          <Text style={styles.navBtnText}>▶</Text>
+        </Pressable>
+      </View>
+    );
+  }
+
+  function renderPPPHeader() {
+    return (
+      <View style={styles.pppHeader}>
+        <Text style={[styles.pppCol, styles.pppCol1]}>Item / Owner</Text>
+        <Text style={[styles.pppCol, styles.pppCol2]}>What we said</Text>
+        <Text style={[styles.pppCol, styles.pppCol3]}>What happened</Text>
+        <Text style={[styles.pppCol, styles.pppCol4]}>What’s next</Text>
+        {screen === 'meeting' ? <Text style={[styles.pppCol, styles.pppCol5]}>Reviewed</Text> : null}
+      </View>
+    );
+  }
+
+  function renderTaskRow(x: { task: Task; cycle?: Cycle }) {
+    const { task, cycle } = x;
+    const isPast = cycleOffset > 0;
+    const isCurrent = cycleOffset === 0;
+
+    const canEditFields = isOwnerEditAllowed(screen) && isCurrent && task.lifecycle === 'active';
+    const actualsMissing = safeTrim(cycle?.actuals || '').length === 0;
+    const nextMissing = safeTrim(cycle?.nextPlan || '').length === 0;
+    const showNotUpdated = screen === 'meeting' && isCurrent && task.lifecycle === 'active' && (actualsMissing || nextMissing);
+
+    return (
+      <View key={task.id} style={[styles.row, task.lifecycle !== 'active' ? styles.rowInactive : null]}>
+        <View style={styles.cell1}>
+          <Text style={styles.taskName}>{task.name}</Text>
+          <Text style={styles.taskMeta}>{task.owner || 'Unassigned'}</Text>
+          {showNotUpdated ? <Text style={styles.badgeWarn}>Not updated yet</Text> : null}
+          {task.lifecycle !== 'active' ? <Text style={styles.badgeMuted}>Inactive</Text> : null}
+        </View>
+
+        <View style={styles.cell2}>
+          <Text style={styles.lockedText}>{cycle?.previousPlan || ''}</Text>
+        </View>
+
+        <View style={styles.cell3}>
+          {canEditFields ? (
+            <TextInput
+              value={cycle?.actuals || ''}
+              onChangeText={(t) => updateCycleField(task.id, viewedCycleIndex, { actuals: t })}
+              placeholder="Owner update…"
+              style={styles.textArea}
+              multiline
+            />
+          ) : (
+            <Text style={styles.plainText}>{cycle?.actuals || ''}</Text>
+          )}
+        </View>
+
+        <View style={styles.cell4}>
+          {canEditFields ? (
+            <TextInput
+              value={cycle?.nextPlan || ''}
+              onChangeText={(t) => updateCycleField(task.id, viewedCycleIndex, { nextPlan: t })}
+              placeholder="Owner plan…"
+              style={styles.textArea}
+              multiline
+            />
+          ) : (
+            <Text style={styles.plainText}>{cycle?.nextPlan || ''}</Text>
+          )}
+        </View>
+
+        {screen === 'meeting' ? (
+          <View style={styles.cell5}>
+            {isPast ? (
+              <Text style={styles.mutedCenter}>{cycle?.reviewed ? '✓' : ''}</Text>
+            ) : task.lifecycle !== 'active' ? (
+              <Text style={styles.mutedCenter}>—</Text>
+            ) : (
+              <Pressable
+                style={[styles.reviewBtn, cycle?.reviewed ? styles.reviewBtnOn : styles.reviewBtnOff]}
+                onPress={() =>
+                  updateCycleField(task.id, viewedCycleIndex, { reviewed: !cycle?.reviewed })
+                }
+              >
+                <Text style={styles.reviewBtnText}>{cycle?.reviewed ? 'Reviewed' : 'Mark'}</Text>
+              </Pressable>
+            )}
+          </View>
+        ) : null}
+      </View>
+    );
+  }
+
+  function renderMeeting() {
+    if (!selectedWorkstream) {
+      return (
+        <Card>
+          <Text style={styles.h1}>No workstream selected</Text>
+          <SmallMuted>Choose a project and workstream above.</SmallMuted>
+        </Card>
+      );
+    }
+
+    const activeRows = activeViewed;
+    const inactiveRows = viewedTasks.filter((x) => x.task.lifecycle !== 'active');
+
+    return (
+      <>
+        <Card>
+          {readiness && cycleOffset === 0 ? (
+            <View style={styles.readinessRow}>
+              <View>
+                <Text style={styles.h2}>Readiness</Text>
+                <Text style={styles.readinessText}>
+                  Prepared: <Text style={styles.bold}>{readiness.prepared}</Text> of{' '}
+                  <Text style={styles.bold}>{readiness.total}</Text>
+                </Text>
+                {readiness.missing > 0 ? (
+                  <Text style={styles.readinessWarn}>{readiness.missing} tasks still need updates</Text>
+                ) : (
+                  <Text style={styles.readinessOk}>All tasks prepared</Text>
+                )}
+              </View>
+
+              <View style={{ alignItems: 'flex-end' }}>
+                <Pressable style={styles.captureBtn} onPress={captureFollowUpInMeeting}>
+                  <Text style={styles.captureBtnText}>＋ Capture follow-up</Text>
+                </Pressable>
+                <SmallMuted>Starts next period</SmallMuted>
+              </View>
+            </View>
+          ) : null}
+
+          <SmallMuted>
+            Meeting actions: mark items reviewed, then close the period. Reorganization happens in Manage.
+          </SmallMuted>
+        </Card>
+
+        <Card>
+          <SectionTitle
+            title="Active items"
+            right={
+              cycleOffset === 0 ? (
+                <Pressable
+                  style={[styles.primaryBtn, !canClosePeriod ? styles.primaryBtnDisabled : null]}
+                  disabled={!canClosePeriod}
+                  onPress={closeCurrentPeriod}
+                >
+                  <Text style={styles.primaryBtnText}>Close period</Text>
+                </Pressable>
+              ) : null
+            }
+          />
+          {renderPPPHeader()}
+          {activeRows.length === 0 ? <Text style={styles.smallMuted}>No active tasks.</Text> : null}
+          {activeRows.map(renderTaskRow)}
+          {cycleOffset === 0 && !allReviewedCurrent ? (
+            <Text style={styles.helpText}>To close: mark all active items as reviewed.</Text>
+          ) : null}
+        </Card>
+
+        {inactiveRows.length > 0 ? (
+          <Card>
+            <SectionTitle title="Inactive (read-only)" />
+            {renderPPPHeader()}
+            {inactiveRows.map(renderTaskRow)}
+          </Card>
+        ) : null}
+      </>
+    );
+  }
+
+  function renderOwners() {
+    if (!selectedWorkstream) {
+      return (
+        <Card>
+          <Text style={styles.h1}>No workstream selected</Text>
+          <SmallMuted>Choose a project and workstream above.</SmallMuted>
+        </Card>
+      );
+    }
+
+    const isPast = cycleOffset > 0;
+    const activeRows = activeViewed;
+
+    return (
+      <>
+        <Card>
+          <Text style={styles.h2}>Owner expectations</Text>
+          <SmallMuted>
+            Owners update “What happened” + “What’s next” before the meeting. Reorganization is only available in Manage.
+          </SmallMuted>
+        </Card>
+
+        <Card>
+          <SectionTitle title="Add a task (owners only)" />
+          <SmallMuted>Allowed here. Not allowed in Meeting. Reorg still only in Manage.</SmallMuted>
+
+          <View style={styles.formRow}>
+            <TextInput value={newTaskName} onChangeText={setNewTaskName} placeholder="Task name" style={styles.input} />
+            <TextInput value={newTaskOwner} onChangeText={setNewTaskOwner} placeholder="Owner (optional)" style={styles.input} />
+          </View>
+
+          <Pressable
+            style={[styles.primaryBtn, safeTrim(newTaskName).length === 0 ? styles.primaryBtnDisabled : null]}
+            onPress={addTaskOwnerPrep}
+            disabled={safeTrim(newTaskName).length === 0}
+          >
+            <Text style={styles.primaryBtnText}>Add task</Text>
+          </Pressable>
+        </Card>
+
+        <Card>
+          <SectionTitle title={isPast ? 'Past period (read-only)' : 'Update your items'} />
+          {renderPPPHeader()}
+          {activeRows.length === 0 ? <Text style={styles.smallMuted}>No active tasks.</Text> : null}
+          {activeRows.map(renderTaskRow)}
+          {isPast ? <Text style={styles.helpText}>Past periods are locked.</Text> : null}
+        </Card>
+      </>
+    );
+  }
+
+  function renderManage() {
+    if (!state) return null;
+
+    const allTasksInWS = state.selectedWorkstreamId
+      ? state.tasks.filter((t) => t.workstreamId === state.selectedWorkstreamId).sort((a, b) => a.name.localeCompare(b.name))
+      : [];
+
+    const active = allTasksInWS.filter((t) => t.lifecycle === 'active');
+    const inactive = allTasksInWS.filter((t) => t.lifecycle !== 'active');
+
+    return (
+      <>
+        <Card>
+          <Text style={styles.h2}>Manage (Backstage)</Text>
+          <SmallMuted>
+            Reorganization happens only here: rename, owner changes, retire/reactivate, workstream creation.
+          </SmallMuted>
+          <View style={{ marginTop: 10 }}>
+            <Pressable style={styles.dangerBtn} onPress={manageResetToSetup}>
+              <Text style={styles.dangerBtnText}>Reset / run Setup Wizard</Text>
+            </Pressable>
+          </View>
+        </Card>
+
+        <Card>
+          <SectionTitle title="Create project" />
+          <View style={styles.formRow}>
+            <TextInput value={manageDraftProjectName} onChangeText={setManageDraftProjectName} placeholder="Project name" style={styles.input} />
+            <Pressable
+              style={[styles.primaryBtn, safeTrim(manageDraftProjectName).length === 0 ? styles.primaryBtnDisabled : null]}
+              onPress={manageCreateProject}
+              disabled={safeTrim(manageDraftProjectName).length === 0}
+            >
+              <Text style={styles.primaryBtnText}>Create</Text>
+            </Pressable>
+          </View>
+        </Card>
+
+        <Card>
+          <SectionTitle title="Create workstream" />
+          <SmallMuted>Cadence is defined at the workstream level (tasks inherit).</SmallMuted>
+
+          <View style={styles.formRow}>
+            <TextInput value={manageDraftWorkstreamName} onChangeText={setManageDraftWorkstreamName} placeholder="Workstream name" style={styles.input} />
+          </View>
+
+          <View style={styles.inlineRow}>
+            {(['daily', 'weekly', 'biweekly', 'monthly', 'quarterly'] as Cadence[]).map((c) => (
+              <Pill key={c} label={c} active={manageDraftWorkstreamCadence === c} onPress={() => setManageDraftWorkstreamCadence(c)} />
+            ))}
+          </View>
+
+          <View style={styles.formRow}>
+            <TextInput
+              value={manageDraftFirstCycleStart}
+              onChangeText={setManageDraftFirstCycleStart}
+              placeholder="First cycle start (YYYY-MM-DD)"
+              style={styles.input}
+              autoCapitalize="none"
+            />
+            <Pressable
+              style={[styles.primaryBtn, safeTrim(manageDraftWorkstreamName).length === 0 ? styles.primaryBtnDisabled : null]}
+              onPress={manageCreateWorkstream}
+              disabled={safeTrim(manageDraftWorkstreamName).length === 0}
+            >
+              <Text style={styles.primaryBtnText}>Create</Text>
+            </Pressable>
+          </View>
+        </Card>
+
+        <Card>
+          <SectionTitle title="Tasks (reorg allowed here only)" />
+          {!state.selectedWorkstreamId ? <SmallMuted>Select a workstream above.</SmallMuted> : null}
+
+          {active.length > 0 ? <Text style={styles.h3}>Active</Text> : null}
+          {active.map((t) => (
+            <View key={t.id} style={styles.manageTaskRow}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.taskName}>{t.name}</Text>
+                <Text style={styles.taskMeta}>Owner: {t.owner || 'Unassigned'}</Text>
+              </View>
+
+              <Pressable
+                style={styles.secondaryBtn}
+                onPress={() => {
+                  Alert.prompt?.('Rename task', 'New name:', [
+                    { text: 'Cancel', style: 'cancel' },
+                    { text: 'Save', onPress: (text?: string) => manageRenameTask(t.id, text || '') },
+
+                  ]);
+                  if (Platform.OS === 'android') Alert.alert('Rename', 'Android: rename prompt not available in this MVP.');
+                }}
+              >
+                <Text style={styles.secondaryBtnText}>Rename</Text>
+              </Pressable>
+
+              <Pressable
+                style={styles.secondaryBtn}
+                onPress={() => {
+                  Alert.prompt?.('Change owner', 'Owner name:', [
+                    { text: 'Cancel', style: 'cancel' },
+                    { text: 'Save', onPress: (text?: string) => manageChangeOwner(t.id, text || '') },
+
+                  ]);
+                  if (Platform.OS === 'android') Alert.alert('Owner', 'Android: owner prompt not available in this MVP.');
+                }}
+              >
+                <Text style={styles.secondaryBtnText}>Owner</Text>
+              </Pressable>
+
+              <Pressable style={styles.dangerBtn} onPress={() => manageRetireTask(t.id)}>
+                <Text style={styles.dangerBtnText}>Retire</Text>
+              </Pressable>
+            </View>
+          ))}
+
+          {inactive.length > 0 ? <Text style={styles.h3}>Inactive</Text> : null}
+          {inactive.map((t) => (
+            <View key={t.id} style={styles.manageTaskRow}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.taskName}>{t.name}</Text>
+                <Text style={styles.taskMeta}>Owner: {t.owner || 'Unassigned'}</Text>
+              </View>
+              <Pressable style={styles.secondaryBtn} onPress={() => manageReactivateTask(t.id)}>
+                <Text style={styles.secondaryBtnText}>Reactivate</Text>
+              </Pressable>
+            </View>
+          ))}
+        </Card>
+      </>
+    );
+  }
+
+  // ------------------------------
+  // Render
+  // ------------------------------
+
+  if (loading) {
+    return (
+      <SafeAreaView style={styles.safe}>
+        <View style={styles.center}>
+          <Text style={styles.h2}>Loading…</Text>
         </View>
       </SafeAreaView>
     );
   }
 
-  // 👉 Stage 0 Setup Wizard: when there is no structure yet
-  if (state.nodes.length === 0) {
+  // ✅ show SetupScreen when needed
+  if (needsSetup || !state) {
     return (
-      <SafeAreaView style={styles.safeArea}>
-        <ScrollView contentContainerStyle={styles.scrollContent}>
+      <SafeAreaView style={[styles.safe, { padding: 12 }]}>
+        <ScrollView>
           <SetupScreen onComplete={handleSetupComplete} />
         </ScrollView>
       </SafeAreaView>
     );
   }
 
-  const today = new Date();
-
-  // ---- Open mode data ----
-  const openEntriesAll: OpenEntry[] = state.nodes.flatMap((node) => {
-    if (node.kind !== 'task' || node.retired) return [];
-    if (!node.cycles || node.cycles.length === 0) return [];
-    const cycle = getCurrentCycle(node);
-    if (cycle.status !== 'open') return [];
-    const targetEnd = getTargetEndDate(node, cycle);
-    const dueState = getDueStateForCycle(node, cycle, today);
-    return [{ node, cycle, dueState, targetEnd }];
-  });
-
-  const openOwners = Array.from(
-    new Set(
-      openEntriesAll
-        .map((e) => (e.cycle.owner || '').trim())
-        .filter((o) => o.length > 0)
-    )
-  ).sort();
-
-  const openEntriesFiltered = openEntriesAll.filter((entry) => {
-    const { node, cycle, dueState } = entry;
-
-    if (state.openOwnerFilter) {
-      const owner = (cycle.owner || '').trim();
-      if (owner !== state.openOwnerFilter) return false;
-    }
-
-    if (state.openKindFilter !== 'all' && node.kind !== state.openKindFilter) {
-      return false;
-    }
-
-    if (
-      state.openCadenceFilter !== 'all' &&
-      node.cadence !== state.openCadenceFilter
-    ) {
-      return false;
-    }
-
-    if (state.openDueFilter !== 'all' && dueState !== state.openDueFilter) {
-      return false;
-    }
-
-    return true;
-  });
-
-  const overdueCount = openEntriesAll.filter(
-    (e) => e.dueState === 'overdue'
-  ).length;
-  const dueSoonCount = openEntriesAll.filter(
-    (e) => e.dueState === 'duesoon'
-  ).length;
-
-  const earliestTargetEnd = (() => {
-    const dates = openEntriesAll
-      .map((e) => e.targetEnd)
-      .filter((d): d is Date => !!d);
-    if (dates.length === 0) return undefined;
-    return dates.reduce((min, d) => (d < min ? d : min), dates[0]);
-  })();
-
-  const earliestTargetEndLabel = earliestTargetEnd
-    ? formatHumanDate(formatISODate(earliestTargetEnd))
-    : undefined;
-
-  // ---- Handlers ----
-
-  // Generic "update node field for current open period"
-  const handleUpdateNodeField = (
-    nodeId: string,
-    field: 'actuals' | 'nextPlan',
-    value: string
-  ) => {
-    setState((prev) => {
-      if (!prev) return prev;
-      const updatedNodes = prev.nodes.map((n) => {
-        if (n.id !== nodeId) return n;
-        if (!n.cycles || n.cycles.length === 0) return n;
-        const current = getCurrentCycle(n);
-        if (current.status !== 'open') {
-          return n;
-        }
-        const updatedCycles: CadenceCycle[] = n.cycles.map(
-          (c: CadenceCycle) =>
-            c.id === current.id
-              ? { ...c, [field]: value, reviewed: false }
-              : c
-        );
-        return { ...n, cycles: updatedCycles };
-      });
-      return { ...prev, nodes: updatedNodes };
-    });
-  };
-
-  // Update owner for current open period on a given node
-  const handleUpdateNodeOwner = (nodeId: string, value: string) => {
-    setState((prev) => {
-      if (!prev) return prev;
-      const updatedNodes = prev.nodes.map((n) => {
-        if (n.id !== nodeId) return n;
-        if (!n.cycles || n.cycles.length === 0) return n;
-        const current = getCurrentCycle(n);
-        if (current.status !== 'open') return n;
-        const updatedCycles: CadenceCycle[] = n.cycles.map(
-          (c: CadenceCycle) =>
-            c.id === current.id ? { ...c, owner: value, reviewed: false } : c
-        );
-        return { ...n, cycles: updatedCycles };
-      });
-      return { ...prev, nodes: updatedNodes };
-    });
-  };
-
-  // Mark a task's current cycle as reviewed (Complete Update)
-  const handleCompleteUpdateForNode = (nodeId: string) => {
-    setState((prev) => {
-      if (!prev) return prev;
-      const updatedNodes = prev.nodes.map((n) => {
-        if (n.id !== nodeId) return n;
-        if (!n.cycles || n.cycles.length === 0) return n;
-        const current = getCurrentCycle(n);
-        if (current.status !== 'open') return n;
-        const updatedCycles: CadenceCycle[] = n.cycles.map(
-          (c: CadenceCycle) =>
-            c.id === current.id ? { ...c, reviewed: true } : c
-        );
-        return { ...n, cycles: updatedCycles };
-      });
-      return { ...prev, nodes: updatedNodes };
-    });
-  };
-
-  // Retire node (primarily tasks for MVP)
-  const handleRetireNode = (nodeId: string) => {
-    setState((prev) => {
-      if (!prev) return prev;
-      const nowStr = formatISODate(new Date());
-      const updatedNodes = prev.nodes.map((n) => {
-        if (n.id !== nodeId) return n;
-        let cycles = n.cycles;
-        if (cycles && cycles.length > 0) {
-          const current = getCurrentCycle(n);
-          if (current.status === 'open') {
-            cycles = cycles.map((c) =>
-              c.id === current.id
-                ? { ...c, status: 'closed', endDate: nowStr }
-                : c
-            );
-          }
-        }
-        return { ...n, cycles, retired: true };
-      });
-
-      const next: AppState = { ...prev, nodes: updatedNodes };
-
-      if (next.activeTaskId === nodeId) next.activeTaskId = undefined;
-      if (next.activeWorkstreamId === nodeId)
-        next.activeWorkstreamId = undefined;
-      if (next.activeProjectId === nodeId) next.activeProjectId = undefined;
-
-      return next;
-    });
-  };
-
-
-  const handleRenameTask = (taskId: string, nextName: string) => {
-    const name = nextName.trim();
-    if (!name) return;
-    setState((prev) => {
-      if (!prev) return prev;
-      const updatedNodes = prev.nodes.map((n) =>
-        n.id === taskId ? { ...n, name } : n
-      );
-      return { ...prev, nodes: updatedNodes };
-    });
-  };
-
-  const handleSetWorkstreamPendingCadence = (workstreamId: string, cadence: CadenceType) => {
-    setState((prev) => {
-      if (!prev) return prev;
-      const updatedNodes = prev.nodes.map((n) => {
-        if (n.id !== workstreamId || n.kind !== 'workstream') return n;
-        // forward-looking: store as pending until next cycle creation
-        return { ...n, pendingCadence: cadence };
-      });
-      return { ...prev, nodes: updatedNodes };
-    });
-  };
-
-
-
-  const handleActivateTask = (taskId: string) => {
-    setState((prev) => {
-      if (!prev) return prev;
-      const nowStr = formatISODate(new Date());
-
-      const updatedNodes = prev.nodes.map((n) => {
-        if (n.id !== taskId) return n;
-        if (!n.retired) return n;
-
-        const cycles = n.cycles || [];
-        const last = cycles.length > 0 ? cycles[cycles.length - 1] : undefined;
-        const nextIndex = last ? (last.index ?? cycles.length - 1) + 1 : 0;
-
-        const newCycle: CadenceCycle = {
-          id: `${n.id}-period-${nextIndex + 1}`,
-          index: nextIndex,
-          status: 'open',
-          startDate: nowStr,
-          previousPlan: last?.nextPlan || '',
-          actuals: '',
-          nextPlan: '',
-          owner: last?.owner || '',
-          reviewed: false,
-        };
-
-        return {
-          ...n,
-          retired: false,
-          cycles: [...cycles, newCycle],
-        };
-      });
-
-      return { ...prev, nodes: updatedNodes, activeTaskId: taskId };
-    });
-  };
-
-  // Complete period for scope (closes current period for all given tasks)
-  const handleCompletePeriodForScope = (taskIds: string[]) => {
-    const idSet = new Set(taskIds);
-    setState((prev) => {
-      if (!prev) return prev;
-
-      // Map: workstreamId -> pendingCadence (if any)
-      const pendingByWs = new Map<string, CadenceType>();
-      prev.nodes.forEach((n) => {
-        if (n.kind === 'workstream' && n.pendingCadence) {
-          pendingByWs.set(n.id, n.pendingCadence);
-        }
-      });
-
-      // Track which workstreams are impacted in this completion
-      const touchedWs = new Set<string>();
-
-      const updatedNodes = prev.nodes.map((n) => {
-        if (!idSet.has(n.id)) return n;
-
-        // Tasks: close current cycle; if parent workstream has pending cadence,
-        // apply it now so it takes effect starting the *next* cycle.
-        if (n.kind === 'task') {
-          if (!n.cycles || n.cycles.length === 0) return n;
-          const current = getCurrentCycle(n);
-          if (current.status !== 'open') return n;
-
-          const parentWsId = n.parentId;
-          const pending = parentWsId ? pendingByWs.get(parentWsId) : undefined;
-          if (parentWsId) touchedWs.add(parentWsId);
-
-          const withCadenceApplied = pending ? { ...n, cadence: pending } : n;
-          return closeCurrentCycle(withCadenceApplied);
-        }
-
-        return n;
-      });
-
-      // If a workstream has a pending cadence AND we just completed a period for tasks under it,
-      // promote pendingCadence -> cadence and clear pendingCadence (forward-looking change becomes current).
-      const finalNodes = updatedNodes.map((n) => {
-        if (n.kind !== 'workstream') return n;
-        if (!touchedWs.has(n.id)) return n;
-        if (!n.pendingCadence) return n;
-        return { ...n, cadence: n.pendingCadence, pendingCadence: undefined };
-      });
-
-      return { ...prev, nodes: finalNodes };
-    });
-  };
-
-
-  const handleSelectProject = (projectId: string) => {
-    setReviewCycleOffset(0);
-    setState((prev) =>
-      prev
-        ? {
-            ...prev,
-            activeProjectId: projectId,
-            activeWorkstreamId: undefined,
-            activeTaskId: undefined,
-          }
-        : prev
-    );
-  };
-
-  const handleSelectWorkstream = (workstreamId: string) => {
-    setReviewCycleOffset(0);
-    setState((prev) => {
-      if (!prev) return prev;
-
-      // Find the workstream to get its parent project
-      const ws = prev.nodes.find(
-        (n) => n.id === workstreamId && n.kind === 'workstream'
-      );
-
-      const projectId = ws?.parentId; // should be the parent project
-
-      return {
-        ...prev,
-        activeProjectId: projectId ?? prev.activeProjectId,
-        activeWorkstreamId: workstreamId,
-        activeTaskId: undefined,
-      };
-    });
-  };
-
-  const handleSelectTask = (taskId: string) => {
-    setReviewCycleOffset(0);
-    setState((prev) => {
-      if (!prev) return prev;
-
-      const task = prev.nodes.find(
-        (n) => n.id === taskId && n.kind === 'task'
-      );
-
-      let workstreamId = task?.parentId;
-      let projectId = prev.activeProjectId;
-
-      if (workstreamId) {
-        const ws = prev.nodes.find(
-          (n) => n.id === workstreamId && n.kind === 'workstream'
-        );
-        if (ws?.parentId) {
-          projectId = ws.parentId;
-        }
-      }
-
-      return {
-        ...prev,
-        activeProjectId: projectId,
-        activeWorkstreamId: workstreamId ?? prev.activeWorkstreamId,
-        activeTaskId: taskId,
-      };
-    });
-  };
-
-  const handleSetViewMode = (mode: ViewMode) => {
-    if (mode === 'review') {
-      setReviewCycleOffset(0);
-    }
-    setState((prev) => {
-      if (!prev) return prev;
-      if (mode === 'owners') {
-        const summaries = getOwnerSummaries(prev.nodes);
-        if (summaries.length === 0) {
-          return {
-            ...prev,
-            viewMode: mode,
-            activeOwner: undefined,
-            ownerVisibleNodeIds: [],
-          };
-        }
-        const existing = summaries.find((s) => s.owner === prev.activeOwner);
-        const chosen = existing ?? summaries[0];
-        const visibleIds = chosen.entries.map((e) => e.node.id);
-        return {
-          ...prev,
-          viewMode: mode,
-          activeOwner: chosen.owner,
-          ownerVisibleNodeIds: visibleIds,
-        };
-      }
-      return { ...prev, viewMode: mode };
-    });
-  };
-
-  const handleSelectOwner = (owner: string) => {
-    setState((prev) => {
-      if (!prev) return prev;
-      const summaries = getOwnerSummaries(prev.nodes);
-      const summary = summaries.find((s) => s.owner === owner);
-      if (!summary) {
-        return { ...prev, activeOwner: undefined, ownerVisibleNodeIds: [] };
-      }
-      const visibleIds = summary.entries.map((e) => e.node.id);
-      return {
-        ...prev,
-        activeOwner: owner,
-        ownerVisibleNodeIds: visibleIds,
-      };
-    });
-  };
-
-  const handleToggleOwnerNodeBranch = (nodeId: string) => {
-    setState((prev) => {
-      if (!prev || !prev.activeOwner || prev.viewMode !== 'owners') return prev;
-      const branchIds = ownedNodesUnder(
-        nodeId,
-        prev.nodes,
-        prev.activeOwner
-      );
-      if (branchIds.length === 0) return prev;
-
-      const currentSet = new Set(prev.ownerVisibleNodeIds);
-      const allVisible = branchIds.every((id) => currentSet.has(id));
-
-      if (allVisible) {
-        branchIds.forEach((id) => currentSet.delete(id));
-      } else {
-        branchIds.forEach((id) => currentSet.add(id));
-      }
-
-      return {
-        ...prev,
-        ownerVisibleNodeIds: Array.from(currentSet),
-      };
-    });
-  };
-
-  // Open mode filter handlers
-  const handleSetOpenOwnerFilter = (owner?: string) => {
-    setState((prev) => (prev ? { ...prev, openOwnerFilter: owner } : prev));
-  };
-
-  const handleSetOpenKindFilter = (kind: 'all' | CadenceKind) => {
-    setState((prev) =>
-      prev
-        ? {
-            ...prev,
-            openKindFilter: kind,
-          }
-        : prev
-    );
-  };
-
-  const handleSetOpenCadenceFilter = (cadence: 'all' | CadenceType) => {
-    setState((prev) =>
-      prev
-        ? {
-            ...prev,
-            openCadenceFilter: cadence,
-          }
-        : prev
-    );
-  };
-
-  const handleSetOpenDueFilter = (due: 'all' | DueState) => {
-    setState((prev) =>
-      prev
-        ? {
-            ...prev,
-            openDueFilter: due,
-          }
-        : prev
-    );
-  };
-
-  // ---- Backup / Restore handlers ----
-
-  const handleDownloadBackupWeb = () => {
-    if (Platform.OS !== 'web') {
-      // Safety guard: this should only be used on web
-      return;
-    }
-
-    const payload: CadenceBackupV1 = {
-      version: 1,
-      createdAt: new Date().toISOString(),
-      state,
-    };
-
-    try {
-      const json = JSON.stringify(payload, null, 2);
-
-      // Use browser APIs via globalThis to avoid TS complaining about DOM types
-      const URLObj: any = (globalThis as any).URL || (window as any).URL;
-      const blob = new Blob([json], { type: 'application/json' });
-
-      const url = URLObj.createObjectURL(blob);
-      const doc: any = (globalThis as any).document;
-
-      if (!doc) {
-        console.warn('Document is not available; cannot trigger download.');
-        return;
-      }
-
-      const a = doc.createElement('a');
-      a.href = url;
-
-      const datePart = new Date().toISOString().slice(0, 10);
-      a.download = `cadence-backup-${datePart}.json`;
-
-      doc.body.appendChild(a);
-      a.click();
-      doc.body.removeChild(a);
-
-      URLObj.revokeObjectURL(url);
-      setBackupInfo('Backup file download started.');
-      setBackupError(null);
-    } catch (err) {
-      console.error('Failed to download backup:', err);
-      setBackupError('Failed to start backup file download.');
-      setBackupInfo(null);
-    }
-  };
-
-
-  const handleImportBackupFileWeb = () => {
-    if (Platform.OS !== 'web') {
-      // Safety guard: this should only be used on web
-      return;
-    }
-
-    try {
-      const doc: any = (globalThis as any).document;
-      if (!doc) {
-        setBackupError('Document is not available; cannot open file picker.');
-        setBackupInfo(null);
-        return;
-      }
-
-      const input = doc.createElement('input');
-      input.type = 'file';
-      input.accept = 'application/json,.json';
-
-      input.onchange = (event: any) => {
-        const file = event?.target?.files?.[0];
-        if (!file) {
-          return;
-        }
-
-        const reader = new FileReader();
-        reader.onload = () => {
-          try {
-            const text = String(reader.result || '');
-            setBackupImportText(text);
-            setBackupInfo(
-              'Backup file loaded. Review JSON below, then tap “Import backup”.'
-            );
-            setBackupError(null);
-          } catch (err) {
-            console.error('Failed to read backup file:', err);
-            setBackupError('Failed to read backup file.');
-            setBackupInfo(null);
-          }
-        };
-        reader.onerror = () => {
-          console.error('FileReader error while reading backup file.');
-          setBackupError('Failed to read backup file.');
-          setBackupInfo(null);
-        };
-
-        reader.readAsText(file);
-      };
-
-      input.click();
-    } catch (err) {
-      console.error('Failed to open file picker:', err);
-      setBackupError('Failed to open file picker for backup import.');
-      setBackupInfo(null);
-    }
-  };
-
-
-  const handleGenerateBackup = () => {
-    // Wrap the current AppState into a versioned envelope
-    const payload: CadenceBackupV1 = {
-      version: 1,
-      createdAt: new Date().toISOString(),
-      state,
-    };
-
-    try {
-      const json = JSON.stringify(payload, null, 2);
-      setBackupExportText(json);
-      setBackupInfo('Backup generated. Copy and store it somewhere safe.');
-      setBackupError(null);
-    } catch (err) {
-      console.error('Failed to generate backup:', err);
-      setBackupError('Failed to generate backup JSON.');
-      setBackupInfo(null);
-    }
-  };
-
-  const handleImportBackup = () => {
-    try {
-      setBackupError(null);
-      setBackupInfo(null);
-
-      if (!backupImportText.trim()) {
-        throw new Error('Paste backup JSON into the Import box first.');
-      }
-
-      const parsed: any = JSON.parse(backupImportText);
-
-      if (!parsed || typeof parsed !== 'object') {
-        throw new Error('Backup JSON must be an object.');
-      }
-      if (parsed.version !== 1) {
-        throw new Error(
-          `Unsupported backup version: ${parsed.version ?? 'unknown'}.`
-        );
-      }
-      if (!parsed.state || typeof parsed.state !== 'object') {
-        throw new Error('Backup is missing a valid "state" field.');
-      }
-      if (!Array.isArray(parsed.state.nodes)) {
-        throw new Error('Backup "state.nodes" must be an array.');
-      }
-
-      const nextState: AppState = parsed.state;
-
-      // Apply imported state
-      setState(nextState);
-      // Reset some local UI (optional)
-      setReviewCycleOffset(0);
-      setShowAdvanced(false);
-
-      setBackupInfo('Backup imported successfully.');
-    } catch (err: any) {
-      console.error('Failed to import backup:', err);
-      setBackupError(
-        err?.message || 'Failed to import backup. Check the JSON and try again.'
-      );
-    }
-  };
-
-
-  // ---- Debug: reset all data ----
-  const handleResetAllData = async () => {
-    try {
-      await AsyncStorage.removeItem(STORAGE_KEY);
-    } catch (err) {
-      console.error('Failed to clear stored Cadence state:', err);
-    }
-
-    // Reset in-memory state
-    setState(initialState);
-    setReviewCycleOffset(0);
-    setShowAdvanced(false);
-    setShowSetup(true); // show Setup again after full reset
-  };
-
-  // Workstream milestones toggle
-  const toggleWorkstreamMilestones = () => {
-    setState((prev) =>
-      prev
-        ? {
-            ...prev,
-            showWorkstreamMilestones: !prev.showWorkstreamMilestones,
-          }
-        : prev
-    );
-  };
-
-  const handleUpdateWorkstreamMilestone = (
-    wsId: string,
-    field: 'milestone' | 'milestoneDate',
-    value: string
-  ) => {
-    setState((prev) => {
-      if (!prev) return prev;
-      const updatedNodes = prev.nodes.map((n) =>
-        n.id === wsId ? { ...n, [field]: value } : n
-      );
-      return { ...prev, nodes: updatedNodes };
-    });
-  };
-
-  // ALL pills actions (Review)
-  const clearProjectSelection = () => {
-    setReviewCycleOffset(0);
-    setState((prev) =>
-      prev
-        ? {
-            ...prev,
-            activeProjectId: undefined,
-            activeWorkstreamId: undefined,
-            activeTaskId: undefined,
-          }
-        : prev
-    );
-  };
-
-  const clearWorkstreamSelection = () => {
-    setReviewCycleOffset(0);
-    setState((prev) =>
-      prev
-        ? {
-            ...prev,
-            activeWorkstreamId: undefined,
-            activeTaskId: undefined,
-          }
-        : prev
-    );
-  };
-
-  const clearTaskSelection = () => {
-    setReviewCycleOffset(0);
-    setState((prev) =>
-      prev
-        ? {
-            ...prev,
-            activeTaskId: undefined,
-          }
-        : prev
-    );
-  };
-
-  // For context line under pills
-  const currentTask = state.nodes.find(
-    (n) => n.id === state.activeTaskId && n.kind === 'task' && !n.retired
-  );
-  const currentWs = state.nodes.find(
-    (n) =>
-      n.id === state.activeWorkstreamId &&
-      n.kind === 'workstream' &&
-      !n.retired
-  );
-  const currentProj = state.nodes.find(
-    (n) =>
-      n.id === state.activeProjectId && n.kind === 'project' && !n.retired
-  );
-
- const reviewTitle = currentWs
-  ? getCadenceReviewTitle(currentWs.cadence)
-  : 'Review';
-
-
-
-  // Advanced toggle handler
-  const toggleAdvanced = () => {
-    setShowAdvanced((prevShow) => {
-      const newShow = !prevShow;
-      if (!newShow && state.viewMode === 'open') {
-        // If we hide advanced while in Open mode, bounce back to Review
-        handleSetViewMode('review');
-      }
-      return newShow;
-    });
-  };
-
-  // ---- Create new objects ----
-
-  const handleCreateProject = () => {
-    if (!state) return;
-    const name = newProjectName.trim() || 'Untitled project';
-    const newId = generateNodeId('project');
-    const newNode: CadenceNode = {
-      id: newId,
-      kind: 'project',
-      name,
-      cadence: 'weekly',
-      cycles: [],
-    };
-    setState({
-      ...state,
-      nodes: [...state.nodes, newNode],
-      activeProjectId: newId,
-      activeWorkstreamId: undefined,
-      activeTaskId: undefined,
-    });
-    setIsCreatingProject(false);
-    setNewProjectName('');
-  };
-
-  const handleCreateWorkstream = () => {
-    if (!state) return;
-    if (!state.activeProjectId) {
-      console.warn('Cannot create workstream without an active project.');
-      return;
-    }
-
-    const name = newWorkstreamName.trim() || 'Untitled workstream';
-    const newId = generateNodeId('workstream');
-    const newNode: CadenceNode = {
-      id: newId,
-      kind: 'workstream',
-      parentId: state.activeProjectId,
-      name,
-      cadence: newWorkstreamCadence,
-      cycles: [],
-    };
-
-    setState({
-      ...state,
-      nodes: [...state.nodes, newNode],
-      activeWorkstreamId: newId,
-      activeTaskId: undefined,
-    });
-    setIsCreatingWorkstream(false);
-    setNewWorkstreamName('');
-    setNewWorkstreamCadence('weekly');
-  };
-
-  const handleCreateTask = () => {
-    if (!state) return;
-    if (!state.activeWorkstreamId) {
-      console.warn('Cannot create task without an active workstream.');
-      return;
-    }
-
-    const name = newTaskName.trim() || 'Untitled task';
-    const newId = generateNodeId('task');
-    const nowStr = formatISODate(new Date());
-    const newCycle: CadenceCycle = {
-      id: `${newId}-period-1`,
-      index: 0,
-      status: 'open',
-      startDate: nowStr,
-      previousPlan: '',
-      actuals: '',
-      nextPlan: '',
-      owner: newTaskOwner.trim(),
-      reviewed: false,
-    };
-    const parentWs = state.nodes.find(
-      (n) => n.id === state.activeWorkstreamId && n.kind === 'workstream'
-    );
-
-    const newNode: CadenceNode = {
-      id: newId,
-      kind: 'task',
-      parentId: state.activeWorkstreamId,
-      name,
-      // Tasks inherit cadence from their workstream (Option A)
-      cadence: (parentWs?.cadence as any) || 'weekly',
-      cycles: [newCycle],
-    };
-
-    setState({
-      ...state,
-      nodes: [...state.nodes, newNode],
-      activeTaskId: newId,
-    });
-    setIsCreatingTask(false);
-    setNewTaskName('');
-    setNewTaskOwner('');
-  };
-
   return (
-    <SafeAreaView style={styles.safeArea}>
-      <ScrollView contentContainerStyle={styles.scrollContent}>
-        {/* Header */}
-        <Text style={styles.appTitle}>Cadence v2 Prototype</Text>
-
-        {/* Mode toggle + Help + Advanced */}
-        <View style={styles.modeRow}>
-          <ModePill
-            label={reviewTitle}
-            active={state.viewMode === 'review'}
-            onPress={() => handleSetViewMode('review')}
-          />
-          <ModePill
-            label="Owners"
-            active={state.viewMode === 'owners'}
-            onPress={() => handleSetViewMode('owners')}
-          />
-          {/* Help + Advanced */}
-          <Pressable
-            onPress={() => setShowHelp((prev) => !prev)}
-            style={[
-              styles.helpPill,
-              showHelp && styles.helpPillActive,
-            ]}
-          >
-            <Text
-              style={[
-                styles.helpPillText,
-                showHelp && styles.helpPillTextActive,
-              ]}
-            >
-              Help
-            </Text>
-          </Pressable>
-          <Pressable
-            onPress={toggleAdvanced}
-            style={[
-              styles.advancedToggle,
-              showAdvanced && styles.advancedToggleActive,
-            ]}
-          >
-            <Text
-              style={[
-                styles.advancedToggleText,
-                showAdvanced && styles.advancedToggleTextActive,
-              ]}
-            >
-              Advanced {showAdvanced ? '▾' : '▸'}
-            </Text>
-          </Pressable>
-        </View>
-
-        {/* Help section */}
-        {showHelp && (
-          <View style={styles.section}>
-            <Text style={styles.sectionTitle}>How to use Cadence</Text>
-            <Text style={styles.cycleMetaSmall}>
-              1. <Text style={{ fontWeight: '600' }}>Set up your structure.</Text>
-              {'\n'}
-              {'   '}• Create a <Text style={{ fontWeight: '600' }}>project</Text> (e.g. “North Star program”).{'\n'}
-              {'   '}• Under a project, create one or more <Text style={{ fontWeight: '600' }}>workstreams</Text>.{'\n'}
-              {'   '}• Under each workstream, create <Text style={{ fontWeight: '600' }}>tasks</Text> with owners.
-            </Text>
-            <Text style={styles.cycleMetaSmall}>
-              2. <Text style={{ fontWeight: '600' }}>During the period</Text> (week / month, etc.) update:{'\n'}
-              {'   '}• <Text style={{ fontWeight: '600' }}>Actuals</Text>: what really happened in this period.{'\n'}
-              {'   '}• <Text style={{ fontWeight: '600' }}>Next Plan</Text>: what you commit to for the next period.
-            </Text>
-            <Text style={styles.cycleMetaSmall}>
-              3. <Text style={{ fontWeight: '600' }}>Cadence Review ritual.</Text>{'\n'}
-              {'   '}• Use the <Text style={{ fontWeight: '600' }}>{reviewTitle} Review</Text> tab once per period.{'\n'}
-              {'   '}• Choose scope via the <Text style={{ fontWeight: '600' }}>project / workstream / task</Text> pills.{'\n'}
-              {'   '}• For the current period, review each task and click{' '}
-              <Text style={{ fontWeight: '600' }}>“Complete Update”</Text> when its Actuals and Next Plan are done.{'\n'}
-              {'   '}• When all tasks in scope are updated, use{' '}
-              <Text style={{ fontWeight: '600' }}>“Complete Period Update”</Text> at the bottom to close this period and open the next.
-            </Text>
-            <Text style={styles.cycleMetaSmall}>
-              4. <Text style={{ fontWeight: '600' }}>Other views.</Text>{'\n'}
-              {'   '}• <Text style={{ fontWeight: '600' }}>Owners</Text> view: see everything assigned to one person, across projects.{'\n'}
-              {'   '}• <Text style={{ fontWeight: '600' }}>Advanced → Open</Text> view: see and filter all open periods (overdue, due soon, etc.).
-            </Text>
-          </View>
-        )}
-
-        {showAdvanced && (
-          <View style={styles.modeRow}>
-            <ModePill
-              label="Open"
-              active={state.viewMode === 'open'}
-              onPress={() => handleSetViewMode('open')}
-            />
-
-            {/* Debug reset */}
-            <Pressable
-              onPress={handleResetAllData}
-              style={styles.debugPill}
-            >
-              <Text style={styles.debugPillText}>Reset all data</Text>
-            </Pressable>
-          </View>
-        )}
-
-        {showAdvanced && (
-          <View style={styles.section}>
-            <Text style={styles.sectionTitle}>Backup &amp; Restore (beta)</Text>
-            <Text style={styles.cycleMetaSmall}>
-              Export your entire cadence state as JSON, and import it later or in a
-              new version. This uses a simple versioned backup format (v1).
-            </Text>
-
-            {/* Info / error messages */}
-            {backupInfo ? (
-              <Text style={styles.backupInfoText}>{backupInfo}</Text>
-            ) : null}
-            {backupError ? (
-              <Text style={styles.backupErrorText}>{backupError}</Text>
-            ) : null}
-
-            {/* Export */}
-            <Text style={styles.fieldLabelSmall}>Export backup JSON</Text>
-            <Text style={styles.cycleMetaSmall}>
-              Tap “Generate backup” to create a JSON snapshot of your current data.
-              Copy and store it somewhere safe (notes, file, etc.).
-            </Text>
-                        <View style={styles.backupButtonRow}>
-              <Pressable
-                style={styles.backupButton}
-                onPress={handleGenerateBackup}
-              >
-                <Text style={styles.backupButtonText}>Generate backup</Text>
-              </Pressable>
-
-              {Platform.OS === 'web' && (
-                <Pressable
-                  style={[styles.backupButton, { marginLeft: 8 }]}
-                  onPress={handleDownloadBackupWeb}
-                >
-                  <Text style={styles.backupButtonText}>
-                    Download backup file
-                  </Text>
-                </Pressable>
-              )}
-            </View>
-
-            <TextInput
-              style={styles.backupTextArea}
-              multiline
-              editable={false}
-              value={backupExportText}
-              placeholder="Backup JSON will appear here."
-            />
-
-            {/* Import */}
-            <Text style={styles.fieldLabelSmall}>Import backup JSON</Text>
-            <Text style={styles.cycleMetaSmall}>
-              Paste JSON from a previous export and tap “Import backup”. This will
-              replace your current cadence data.
-            </Text>
-                        <TextInput
-              style={styles.backupTextArea}
-              multiline
-              value={backupImportText}
-              onChangeText={setBackupImportText}
-              placeholder="Paste backup JSON here to restore, or choose a file on web."
-            />
-            <View style={styles.backupButtonRow}>
-              <Pressable
-                style={styles.backupButton}
-                onPress={handleImportBackup}
-              >
-                <Text style={styles.backupButtonText}>Import backup</Text>
-              </Pressable>
-
-              {Platform.OS === 'web' && (
-                <Pressable
-                  style={[styles.backupButton, { marginLeft: 8 }]}
-                  onPress={handleImportBackupFileWeb}
-                >
-                  <Text style={styles.backupButtonText}>
-                    Choose backup file
-                  </Text>
-                </Pressable>
-              )}
-            </View>
-
-          </View>
-        )}
-
-
-        {/* Tiny getting-started guide – only when no projects exist */}
-        {projects.length === 0 && (
-          <View style={styles.section}>
-            <Text style={styles.sectionTitle}>Getting started</Text>
-            <Text style={styles.cycleMetaSmall}>
-              1. Create a project using “＋ Add project”.{'\n'}
-              2. Add one or more workstreams under that project.{'\n'}
-              3. Add tasks under a workstream, then use “Cadence Review”
-              once per week to update Actuals and Next Plan.
-            </Text>
-          </View>
-        )}
-
-        {state.viewMode !== 'open' && (
-          <View style={styles.openSummaryBar}>
-            <Text style={styles.openSummaryText}>
-              Open periods: {openEntriesAll.length} (Overdue:{' '}
-              {overdueCount}, Due soon: {dueSoonCount})
-            </Text>
-            {earliestTargetEndLabel ? (
-              <Text style={styles.openSummaryHint}>
-                Next checkpoint: {earliestTargetEndLabel}. Switch to
-                Advanced → "Open" mode to review & complete.
-              </Text>
-            ) : (
-              <Text style={styles.openSummaryHint}>
-                No upcoming checkpoints. All tracked periods are closed.
-              </Text>
-            )}
-          </View>
-        )}
-
-        {/* Owner pills (only in Owners mode) */}
-        {state.viewMode === 'owners' && (
-          <>
-            <Text style={styles.selectorLabel}>Owners</Text>
-            <View style={styles.ownerPillRow}>
-              {ownerSummaries.length === 0 ? (
-                <Text style={styles.cycleMetaSmall}>
-                  No owners set yet for current periods.
-                </Text>
-              ) : (
-                ownerSummaries.map((s) => (
-                  <OwnerPill
-                    key={s.owner}
-                    label={s.owner}
-                    active={s.owner === state.activeOwner}
-                    onPress={() => handleSelectOwner(s.owner)}
-                  />
-                ))
-              )}
-            </View>
-          </>
-        )}
-
-        {/* Open-mode filters */}
-        {state.viewMode === 'open' && (
-          <View style={styles.section}>
-            <Text style={styles.sectionTitle}>Open Period Filters</Text>
-
-            {/* Owner filter */}
-            <Text style={styles.selectorLabel}>Owner</Text>
-            <View style={styles.ownerPillRow}>
-              <OwnerPill
-                label="All"
-                active={!state.openOwnerFilter}
-                onPress={() => handleSetOpenOwnerFilter(undefined)}
-              />
-              {openOwners.map((owner) => (
-                <OwnerPill
-                  key={owner}
-                  label={owner}
-                  active={state.openOwnerFilter === owner}
-                  onPress={() => handleSetOpenOwnerFilter(owner)}
-                />
-              ))}
-            </View>
-
-            {/* Level filter */}
-            <Text style={styles.selectorLabel}>Level</Text>
-            <View style={styles.ownerPillRow}>
-              <OwnerPill
-                label="All"
-                active={state.openKindFilter === 'all'}
-                onPress={() => handleSetOpenKindFilter('all')}
-              />
-              <OwnerPill
-                label="Projects"
-                active={state.openKindFilter === 'project'}
-                onPress={() => handleSetOpenKindFilter('project')}
-              />
-              <OwnerPill
-                label="Workstreams"
-                active={state.openKindFilter === 'workstream'}
-                onPress={() => handleSetOpenKindFilter('workstream')}
-              />
-              <OwnerPill
-                label="Tasks"
-                active={state.openKindFilter === 'task'}
-                onPress={() => handleSetOpenKindFilter('task')}
-              />
-            </View>
-
-            {/* Cadence filter */}
-            <Text style={styles.selectorLabel}>Cadence</Text>
-            <View style={styles.ownerPillRow}>
-              <OwnerPill
-                label="All"
-                active={state.openCadenceFilter === 'all'}
-                onPress={() => handleSetOpenCadenceFilter('all')}
-              />
-              <OwnerPill
-                label="Daily"
-                active={state.openCadenceFilter === 'daily'}
-                onPress={() => handleSetOpenCadenceFilter('daily')}
-              />
-              <OwnerPill
-                label="Weekly"
-                active={state.openCadenceFilter === 'weekly'}
-                onPress={() => handleSetOpenCadenceFilter('weekly')}
-              />
-              <OwnerPill
-                label="Biweekly"
-                active={state.openCadenceFilter === 'biweekly'}
-                onPress={() => handleSetOpenCadenceFilter('biweekly')}
-              />
-              <OwnerPill
-                label="Monthly"
-                active={state.openCadenceFilter === 'monthly'}
-                onPress={() => handleSetOpenCadenceFilter('monthly')}
-              />
-              <OwnerPill
-                label="Quarterly"
-                active={state.openCadenceFilter === 'quarterly'}
-                onPress={() => handleSetOpenCadenceFilter('quarterly')}
-              />
-            </View>
-
-            {/* Due status filter */}
-            <Text style={styles.selectorLabel}>Status</Text>
-            <View style={styles.ownerPillRow}>
-              <OwnerPill
-                label="All"
-                active={state.openDueFilter === 'all'}
-                onPress={() => handleSetOpenDueFilter('all')}
-              />
-              <OwnerPill
-                label="On time"
-                active={state.openDueFilter === 'ontime'}
-                onPress={() => handleSetOpenDueFilter('ontime')}
-              />
-              <OwnerPill
-                label="Due soon"
-                active={state.openDueFilter === 'duesoon'}
-                onPress={() => handleSetOpenDueFilter('duesoon')}
-              />
-              <OwnerPill
-                label="Overdue"
-                active={state.openDueFilter === 'overdue'}
-                onPress={() => handleSetOpenDueFilter('overdue')}
-              />
-            </View>
-          </View>
-        )}
-
-        {/* Project pills */}
-        <Text style={styles.selectorLabel}>Projects</Text>
-        <View style={styles.pillRow}>
-          {inReviewMode && (
-            <SelectorPill
-              label="ALL"
-              active={!state.activeProjectId}
-              onPress={clearProjectSelection}
-            />
-          )}
-
-          {projects.map((p) => {
-            const highlighted =
-              state.viewMode === 'owners' &&
-              nodeOrDescendantOwnedBy(p, state.nodes, state.activeOwner);
-            const disabled =
-              state.viewMode === 'owners' && !highlighted;
-
-            const onPress = () => {
-              if (state.viewMode === 'owners') {
-                if (highlighted) {
-                  handleToggleOwnerNodeBranch(p.id);
-                }
-              } else {
-                handleSelectProject(p.id);
-              }
-            };
-
-            return (
-              <SelectorPill
-                key={p.id}
-                label={p.name}
-                active={p.id === state.activeProjectId}
-                highlighted={highlighted}
-                disabled={disabled}
-                onPress={onPress}
-              />
-            );
-          })}
-
-          {/* Add Project pill */}
-          <Pressable
-            style={styles.addPill}
-            onPress={() => setIsCreatingProject(true)}
-          >
-            <Text style={styles.addPillText}>＋ Add project</Text>
-          </Pressable>
-        </View>
-
-        {/* New Project entry row */}
-        {isCreatingProject && (
-          <View style={styles.createRow}>
-            <TextInput
-              style={styles.createTextInput}
-              placeholder="Project name"
-              value={newProjectName}
-              onChangeText={setNewProjectName}
-            />
-            <View style={styles.createActionsRow}>
-              <Pressable
-                style={styles.createActionPill}
-                onPress={handleCreateProject}
-              >
-                <Text style={styles.createActionPillText}>Add</Text>
-              </Pressable>
-              <Pressable
-                style={styles.createActionPillSecondary}
-                onPress={() => {
-                  setIsCreatingProject(false);
-                  setNewProjectName('');
-                }}
-              >
-                <Text style={styles.createActionPillSecondaryText}>
-                  Cancel
-                </Text>
-              </Pressable>
-            </View>
-          </View>
-        )}
-
-        {/* Workstream pills */}
-        <Text style={styles.selectorLabel}>
-          Workstreams{' '}
-          <Text
-            style={styles.linkText}
-            onPress={toggleWorkstreamMilestones}
-          >
-            [
-            {state.showWorkstreamMilestones
-              ? 'Hide milestones'
-              : 'Show milestones'}
-            ]
-          </Text>
-        </Text>
-        <View style={styles.pillRow}>
-          
-          {workstreams.length === 0 ? (
-            <Text style={styles.cycleMetaSmall}>
-              No workstreams yet.
-            </Text>
-          ) : (
-            workstreams.map((ws) => {
-              const highlighted =
-                state.viewMode === 'owners' &&
-                nodeOrDescendantOwnedBy(ws, state.nodes, state.activeOwner);
-              const disabled =
-                state.viewMode === 'owners' && !highlighted;
-
-              const onPress = () => {
-                if (state.viewMode === 'owners') {
-                  if (highlighted) {
-                    handleToggleOwnerNodeBranch(ws.id);
-                  }
-                } else {
-                  handleSelectWorkstream(ws.id);
-                }
-              };
-
-              return (
-                <SelectorPill
-                  key={ws.id}
-                  label={ws.name}
-                  active={ws.id === state.activeWorkstreamId}
-                  highlighted={highlighted}
-                  disabled={disabled}
-                  onPress={onPress}
-                />
-              );
-            })
-          )}
-
-          {/* Add Workstream pill (requires active project) */}
-          <Pressable
-            style={[
-              styles.addPill,
-              !state.activeProjectId && styles.addPillDisabled,
-            ]}
-            onPress={() => {
-              if (!state.activeProjectId) {
-                return; // require a selected project
-              }
-              setIsCreatingWorkstream(true);
-            }}
-          >
-            <Text style={styles.addPillText}>＋ Add workstream</Text>
-          </Pressable>
-        </View>
-
-        {/* New Workstream entry row */}
-        {isCreatingWorkstream && (
-          <View style={styles.createRow}>
-            <TextInput
-              style={styles.createTextInput}
-              placeholder="Workstream name"
-              value={newWorkstreamName}
-              onChangeText={setNewWorkstreamName}
-            />
-
-            <View style={styles.cadencePickerRow}>
-              <Text style={styles.cadencePickerLabel}>Cadence:</Text>
-              <View style={styles.cadenceChipRow}>
-                {(
-                  ['daily', 'weekly', 'biweekly', 'monthly', 'quarterly'] as CadenceType[]
-                ).map((c) => (
-                  <Pressable
-                    key={c}
-                    onPress={() => setNewWorkstreamCadence(c)}
-                    style={[
-                      styles.cadenceChip,
-                      newWorkstreamCadence === c && styles.cadenceChipActive,
-                    ]}
-                  >
-                    <Text
-                      style={[
-                        styles.cadenceChipText,
-                        newWorkstreamCadence === c && styles.cadenceChipTextActive,
-                      ]}
-                    >
-                      {getCadenceLabel(c)}
-                    </Text>
-                  </Pressable>
-                ))}
-              </View>
-            </View>
-
-            <View style={styles.createActionsRow}>
-              <Pressable
-                style={styles.createActionPill}
-                onPress={handleCreateWorkstream}
-              >
-                <Text style={styles.createActionPillText}>Add</Text>
-              </Pressable>
-              <Pressable
-                style={styles.createActionPillSecondary}
-                onPress={() => {
-                  setIsCreatingWorkstream(false);
-                  setNewWorkstreamName('');
-                  setNewWorkstreamCadence('weekly');
-                }}
-              >
-                <Text style={styles.createActionPillSecondaryText}>
-                  Cancel
-                </Text>
-              </Pressable>
-            </View>
-          </View>
-        )}
-
-
-        {/* Workstream milestones section */}
-{state.showWorkstreamMilestones && workstreams.length > 0 && (
-  <View style={styles.section}>
-    <Text style={styles.sectionTitle}>Workstream Milestones</Text>
-    {workstreams.map((ws) => (
-      <View key={ws.id} style={styles.milestoneRow}>
-        <Text style={styles.milestoneWsName}>{ws.name}</Text>
-
-        {/* Milestone text */}
-        <TextInput
-          style={styles.milestoneInput}
-          placeholder="Milestone"
-          value={ws.milestone || ''}
-          onChangeText={(text) =>
-            handleUpdateWorkstreamMilestone(ws.id, 'milestone', text)
-          }
-        />
-
-        {/* Milestone date: web = text input, native = date picker */}
-        {Platform.OS === 'web' ? (
-          // --- Web: simple text input fallback ---
-          <TextInput
-            style={styles.milestoneDateInput}
-            placeholder="YYYY-MM-DD"
-            value={ws.milestoneDate || ''}
-            onChangeText={(text) =>
-              handleUpdateWorkstreamMilestone(ws.id, 'milestoneDate', text)
-            }
-          />
-        ) : (
-          // --- Native (iOS / Android): calendar picker ---
-          <>
-            <Pressable
-              style={styles.milestoneDateInput}
-              onPress={() => {
-                const baseDate = ws.milestoneDate
-                  ? parseISODate(ws.milestoneDate)
-                  : new Date();
-                setMilestonePickerWsId(ws.id);
-                setMilestonePickerDate(baseDate);
-              }}
-            >
-              <Text style={styles.milestoneDateText}>
-                {ws.milestoneDate
-                  ? formatHumanDate(ws.milestoneDate) // e.g. "December 6"
-                  : 'Pick date'}
-              </Text>
-            </Pressable>
-
-            {milestonePickerWsId === ws.id && milestonePickerDate && (
-              <DateTimePicker
-                value={milestonePickerDate}
-                mode="date"
-                display="default"
-                onChange={(event, selectedDate) => {
-                  // User cancelled
-                  // @ts-ignore – event.type exists at runtime on native
-                  if (event.type === 'dismissed') {
-                    setMilestonePickerWsId(null);
-                    setMilestonePickerDate(null);
-                    return;
-                  }
-
-                  const d = selectedDate || milestonePickerDate;
-                  setMilestonePickerDate(d);
-                  const iso = formatISODate(d);
-                  handleUpdateWorkstreamMilestone(ws.id, 'milestoneDate', iso);
-
-                  // On iOS the picker stays open, so close it after selection.
-                  if (Platform.OS !== 'android') {
-                    setMilestonePickerWsId(null);
-                    setMilestonePickerDate(null);
-                  }
-                }}
-              />
-            )}
-          </>
-        )}
-      </View>
-    ))}
-  </View>
-)}
-
-        {/* Task pills */}
-        <Text style={styles.selectorLabel}>Tasks</Text>
-        <View style={styles.pillRow}>
-          {inReviewMode && (
-            <SelectorPill
-              label="ALL"
-              active={!state.activeTaskId}
-              onPress={clearTaskSelection}
-            />
-          )}
-
-          {tasks.length === 0 ? (
-            <Text style={styles.cycleMetaSmall}>No tasks yet.</Text>
-          ) : (
-            tasks.map((t) => {
-              const highlighted =
-                state.viewMode === 'owners' &&
-                nodeOrDescendantOwnedBy(t, state.nodes, state.activeOwner);
-              const disabled =
-                state.viewMode === 'owners' && !highlighted;
-
-              const onPress = () => {
-                if (state.viewMode === 'owners') {
-                  if (highlighted) {
-                    handleToggleOwnerNodeBranch(t.id);
-                  }
-                } else {
-                  handleSelectTask(t.id);
-                }
-              };
-
-              return (
-                <SelectorPill
-                  key={t.id}
-                  label={t.name}
-                  active={t.id === state.activeTaskId}
-                  highlighted={highlighted}
-                  disabled={disabled}
-                  onPress={onPress}
-                />
-              );
-            })
-          )}
-
-          
-          {/* Inactive tasks (collapsible) */}
-          {state.viewMode !== 'owners' && inactiveTasks.length > 0 && (
-            <View style={styles.inactiveTasksBlock}>
-              <Pressable
-                style={styles.inactiveTasksToggle}
-                onPress={() => setShowInactiveTasks((p) => !p)}
-              >
-                <Text style={styles.inactiveTasksToggleText}>
-                  Inactive tasks ({inactiveTasks.length}) {showInactiveTasks ? '▾' : '▸'}
-                </Text>
-              </Pressable>
-
-              {showInactiveTasks && (
-                <View style={styles.inactiveTasksPillRow}>
-                  {inactiveTasks.map((t) => (
-                    <Pressable
-                      key={t.id}
-                      style={styles.inactiveTaskPill}
-                      onPress={() => handleActivateTask(t.id)}
-                    >
-                      <Text style={styles.inactiveTaskPillText}>{t.name}</Text>
-                    </Pressable>
-                  ))}
-                </View>
-              )}
-            </View>
-          )}
-
-{/* Add Task pill (requires active workstream) */}
-          {state.viewMode !== 'owners' && (
-            <Pressable
-              style={[
-                styles.addPill,
-                !state.activeWorkstreamId && styles.addPillDisabled,
-              ]}
-              onPress={() => {
-                if (!state.activeWorkstreamId) {
-                  return;
-                }
-                setIsCreatingTask(true);
-              }}
-            >
-              <Text style={styles.addPillText}>＋ Add task</Text>
-            </Pressable>
-          )}
-        </View>
-
-        {/* New Task entry row */}
-        {isCreatingTask && (
-          <View style={styles.createRow}>
-            <TextInput
-              style={styles.createTextInput}
-              placeholder="Task name"
-              value={newTaskName}
-              onChangeText={setNewTaskName}
-            />
-            <TextInput
-              style={styles.createTextInput}
-              placeholder="Owner"
-              value={newTaskOwner}
-              onChangeText={setNewTaskOwner}
-            />
-            <Text style={styles.createHelperText}>
-              Cadence is inherited from the selected workstream.
-            </Text>
-            <View style={styles.createActionsRow}>
-              <Pressable
-                style={styles.createActionPill}
-                onPress={handleCreateTask}
-              >
-                <Text style={styles.createActionPillText}>Add</Text>
-              </Pressable>
-              <Pressable
-                style={styles.createActionPillSecondary}
-                onPress={() => {
-                  setIsCreatingTask(false);
-                  setNewTaskName('');
-                  setNewTaskOwner('');
-                }}
-              >
-                <Text style={styles.createActionPillSecondaryText}>
-                  Cancel
-                </Text>
-              </Pressable>
-            </View>
-          </View>
-        )}
-
-
-        {/* Active context line (Review only) */}
-        {state.viewMode === 'review' &&
-          currentTask &&
-          currentWs &&
-          currentProj && (
-            <View style={styles.activeContextRow}>
-              <Text style={styles.nodeSubtitle}>
-                Project: {currentProj.name} · Workstream: {currentWs.name} · Cadence:{' '}
-                {getCadenceLabel(currentWs.cadence)}
-                {currentWs.pendingCadence
-                  ? ` (next: ${getCadenceLabel(currentWs.pendingCadence)})`
-                  : ''}
-              </Text>
-
-              {/* Workstream kebab: current cycle only */}
-              {reviewCycleOffset === 0 && (
-                <Pressable
-                  style={styles.kebabButtonSmall}
-                  onPress={() => onOpenWorkstreamMenu(currentWs.id)}
-                >
-                  <Text style={styles.kebabButtonText}>⋯</Text>
-                </Pressable>
-              )}
-            </View>
-          )}
-
-        {/* Main content */}
-        {state.viewMode === 'review' ? (
-          <ReviewSection
-            nodes={state.nodes}
-            activeProjectId={state.activeProjectId}
-            activeWorkstreamId={state.activeWorkstreamId}
-            activeTaskId={state.activeTaskId}
-            onUpdateField={handleUpdateNodeField}
-            onUpdateOwner={handleUpdateNodeOwner}
-            onCompleteUpdateForNode={handleCompleteUpdateForNode}
-            onRetireNode={handleRetireNode}
-            reviewCycleOffset={reviewCycleOffset}
-            onChangeReviewCycleOffset={setReviewCycleOffset}
-            onCompletePeriodForScope={handleCompletePeriodForScope}
-            onOpenTaskMenu={onOpenTaskMenu}
-          />
-        ) : state.viewMode === 'owners' ? (
-          <OwnersOverviewSection
-            summary={activeOwnerSummary}
-            visibleNodeIds={state.ownerVisibleNodeIds}
-            onUpdateField={handleUpdateNodeField}
-          />
-        ) : (
-          <OpenModeSection
-            entries={openEntriesFiltered}
-            onUpdateField={handleUpdateNodeField}
-            onUpdateOwner={handleUpdateNodeOwner}
-            onCompleteUpdateForNode={handleCompleteUpdateForNode}
-            onRetireNode={handleRetireNode}
-            onOpenTaskMenu={onOpenTaskMenu}
-          />
-        )}
+    <SafeAreaView style={styles.safe}>
+      {renderTopNav()}
+      <ScrollView contentContainerStyle={styles.container}>
+        {renderPeriodNavigator()}
+        {screen === 'meeting' ? renderMeeting() : null}
+        {screen === 'owners' ? renderOwners() : null}
+        {screen === 'manage' ? renderManage() : null}
+        <View style={{ height: 36 }} />
       </ScrollView>
-
-      {/* Task actions modal */}
-      <Modal
-        transparent
-        visible={!!taskMenuTaskId && !!taskMenuNode}
-        animationType="fade"
-        onRequestClose={closeTaskMenu}
-      >
-        <Pressable style={styles.modalOverlay} onPress={closeTaskMenu}>
-          <View style={styles.modalCard}>
-            <Text style={styles.modalTitle}>Task</Text>
-
-            <Text style={styles.modalLabel}>Name</Text>
-            <TextInput
-              style={styles.modalTextInput}
-              value={taskMenuDraftName}
-              onChangeText={setTaskMenuDraftName}
-              placeholder="Task name"
-            />
-
-
-            <View style={styles.modalButtonRow}>
-              <Pressable
-                style={styles.modalPrimaryButton}
-                onPress={() => {
-                  if (!taskMenuNode) return;
-                  handleRenameTask(taskMenuNode.id, taskMenuDraftName);
-                  closeTaskMenu();
-                }}
-              >
-                <Text style={styles.modalPrimaryButtonText}>Save</Text>
-              </Pressable>
-
-              {taskMenuNode?.retired ? (
-                <Pressable
-                  style={styles.modalSecondaryButton}
-                  onPress={() => {
-                    if (!taskMenuNode) return;
-                    handleActivateTask(taskMenuNode.id);
-                    closeTaskMenu();
-                  }}
-                >
-                  <Text style={styles.modalSecondaryButtonText}>Activate</Text>
-                </Pressable>
-              ) : (
-                <Pressable
-                  style={styles.modalDangerButton}
-                  onPress={() => {
-                    if (!taskMenuNode) return;
-                    handleRetireNode(taskMenuNode.id);
-                    closeTaskMenu();
-                  }}
-                >
-                  <Text style={styles.modalDangerButtonText}>Retire</Text>
-                </Pressable>
-              )}
-
-              <Pressable
-                style={styles.modalCancelButton}
-                onPress={closeTaskMenu}
-              >
-                <Text style={styles.modalCancelButtonText}>Cancel</Text>
-              </Pressable>
-            </View>
-          </View>
-        </Pressable>
-      </Modal>
-
-      {/* Workstream actions modal */}
-      <Modal
-        transparent
-        visible={!!workstreamMenuWsId && !!workstreamMenuNode}
-        animationType="fade"
-        onRequestClose={closeWorkstreamMenu}
-      >
-        <Pressable style={styles.modalOverlay} onPress={closeWorkstreamMenu}>
-          <View style={styles.modalCard}>
-            <Text style={styles.modalTitle}>Workstream</Text>
-
-            <Text style={styles.modalLabel}>Cadence (effective next cycle)</Text>
-            <Text style={styles.modalHelper}>
-              This will take effect when you complete the current period update.
-            </Text>
-
-            <View style={styles.modalChipRow}>
-              {(
-                ['daily', 'weekly', 'biweekly', 'monthly', 'quarterly'] as CadenceType[]
-              ).map((c) => (
-                <Pressable
-                  key={c}
-                  style={[
-                    styles.modalChip,
-                    workstreamMenuDraftCadence === c && styles.modalChipActive,
-                  ]}
-                  onPress={() => setWorkstreamMenuDraftCadence(c)}
-                >
-                  <Text
-                    style={[
-                      styles.modalChipText,
-                      workstreamMenuDraftCadence === c && styles.modalChipTextActive,
-                    ]}
-                  >
-                    {getCadenceLabel(c)}
-                  </Text>
-                </Pressable>
-              ))}
-            </View>
-
-            <View style={styles.modalButtonRow}>
-              <Pressable
-                style={styles.modalPrimaryButton}
-                onPress={() => {
-                  if (!workstreamMenuNode) return;
-                  handleSetWorkstreamPendingCadence(
-                    workstreamMenuNode.id,
-                    workstreamMenuDraftCadence
-                  );
-                  closeWorkstreamMenu();
-                }}
-              >
-                <Text style={styles.modalPrimaryButtonText}>Save</Text>
-              </Pressable>
-
-              <Pressable
-                style={styles.modalCancelButton}
-                onPress={closeWorkstreamMenu}
-              >
-                <Text style={styles.modalCancelButtonText}>Cancel</Text>
-              </Pressable>
-            </View>
-          </View>
-        </Pressable>
-      </Modal>
-
-
     </SafeAreaView>
   );
 }
 
-// ---- Styles ----
+// ------------------------------
+// Styles (same visual language as Dec21)
+// ------------------------------
 
 const styles = StyleSheet.create({
-  
-    backupTextArea: {
-    marginTop: 4,
-    marginBottom: 8,
-    minHeight: 80,
-    maxHeight: 200,
-    borderWidth: 1,
-    borderColor: '#cfd8dc',
-    borderRadius: 6,
-    paddingHorizontal: 8,
-    paddingVertical: 6,
-    fontSize: 11,
-    backgroundColor: '#fafafa',
-    textAlignVertical: 'top',
-  },
-  backupButtonRow: {
-    flexDirection: 'row',
-    justifyContent: 'flex-start',
-    marginTop: 4,
-    marginBottom: 4,
-  },
-  backupButton: {
-    paddingVertical: 4,
-    paddingHorizontal: 10,
-    borderRadius: 999,
-    backgroundColor: '#e3f2fd',
-    borderWidth: 1,
-    borderColor: '#90caf9',
-  },
-  backupButtonText: {
-    fontSize: 12,
-    fontWeight: '600',
-    color: '#0d47a1',
-  },
-  backupErrorText: {
-    fontSize: 11,
-    color: '#c62828',
-    marginBottom: 4,
-  },
-  backupInfoText: {
-    fontSize: 11,
-    color: '#2e7d32',
-    marginBottom: 4,
-  },
+  safe: { flex: 1, backgroundColor: '#0b0b0c' },
+  container: { padding: 12, gap: 12 },
 
-  
-  debugPill: {
-    paddingVertical: 4,
-    paddingHorizontal: 8,
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: '#ef9a9a',
-    backgroundColor: '#ffebee',
-    marginLeft: 8,
-  },
-  debugPillText: {
-    fontSize: 11,
-    fontWeight: '600',
-    color: '#b71c1c',
-  },
+  center: { flex: 1, alignItems: 'center', justifyContent: 'center' },
 
-  safeArea: {
-    flex: 1,
-    backgroundColor: '#f3f3f3',
-  },
-  scrollContent: {
-    padding: 16,
-    paddingBottom: 32,
-  },
-  appTitle: {
-    fontSize: 22,
-    fontWeight: '800',
-    marginBottom: 8,
-  },
-  nodeTitle: {
-    fontSize: 18,
-    fontWeight: '700',
-    marginTop: 8,
-  },
-  nodeSubtitle: {
-    fontSize: 14,
-    color: '#555',
-    marginBottom: 12,
-  },
-  activeContextRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-  },
-  section: {
-    marginTop: 16,
-    padding: 12,
-    borderRadius: 10,
-    backgroundColor: '#ffffff',
-    shadowColor: '#000',
-    shadowOpacity: 0.05,
-    shadowRadius: 4,
-    shadowOffset: { width: 0, height: 2 },
-    elevation: 2,
-  },
-  sectionTitle: {
-    fontSize: 16,
-    fontWeight: '700',
-    marginBottom: 8,
-  },
-  cycleMeta: {
-    fontSize: 14,
-    color: '#444',
-  },
-  cycleMetaSmall: {
-    fontSize: 12,
-    color: '#777',
-    marginTop: 2,
-    marginBottom: 4,
-  },
-  fieldLabel: {
-    fontSize: 14,
-    fontWeight: '600',
-    marginBottom: 4,
-  },
-  fieldLabelSmall: {
-    fontSize: 12,
-    fontWeight: '600',
-    marginTop: 6,
-  },
-  fieldInputPast: {
-    backgroundColor: '#f0f0f0',
-    color: '#333',
-  },
-  fieldInputCurrentActuals: {
-    backgroundColor: '#e3f2fd',
-    color: '#111',
-  },
-  fieldInputCurrentNext: {
-    backgroundColor: '#fff9c4',
-    color: '#111',
-  },
-  pastCycleCard: {
-    marginTop: 10,
+  appTitle: { color: '#fff', fontSize: 18, fontWeight: '700' },
+
+  topNav: { padding: 12, paddingTop: 10, backgroundColor: '#0b0b0c', borderBottomWidth: 1, borderBottomColor: '#1f1f22' },
+  topNavRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 10 },
+  topNavPills: { flexDirection: 'row', gap: 8 },
+
+  scopeRow: { marginTop: 10, gap: 10 },
+  scopeBlock: { gap: 6 },
+  inlineRow: { flexDirection: 'row', gap: 8, alignItems: 'center' },
+
+  pill: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 999 },
+  pillActive: { backgroundColor: '#ffffff' },
+  pillInactive: { backgroundColor: '#151518' },
+  pillText: { fontSize: 13, fontWeight: '600' },
+  pillTextActive: { color: '#0b0b0c' },
+  pillTextInactive: { color: '#e6e6e6' },
+
+  card: { backgroundColor: '#111114', borderRadius: 16, padding: 12, borderWidth: 1, borderColor: '#222228' },
+
+  sectionHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-end', marginBottom: 8 },
+  sectionTitle: { color: '#fff', fontSize: 15, fontWeight: '700' },
+
+  h1: { color: '#fff', fontSize: 18, fontWeight: '800' },
+  h2: { color: '#fff', fontSize: 16, fontWeight: '800' },
+  h3: { color: '#fff', fontSize: 14, fontWeight: '800', marginTop: 6, marginBottom: 6 },
+
+  smallMuted: { color: '#a6a6ad', fontSize: 12, lineHeight: 16 },
+  helpText: { color: '#a6a6ad', fontSize: 12, marginTop: 8 },
+
+  periodNav: { flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 4 },
+  navBtn: { width: 42, height: 42, borderRadius: 12, alignItems: 'center', justifyContent: 'center', backgroundColor: '#151518', borderWidth: 1, borderColor: '#2a2a31' },
+  navBtnDisabled: { opacity: 0.4 },
+  navBtnText: { color: '#fff', fontSize: 16, fontWeight: '800' },
+  periodCenter: { flex: 1, alignItems: 'center', gap: 2 },
+  periodTitle: { color: '#fff', fontSize: 16, fontWeight: '800' },
+  periodSub: { color: '#d4d4d8', fontSize: 13, fontWeight: '600' },
+  periodHint: { color: '#a6a6ad', fontSize: 12 },
+
+  readinessRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12, marginBottom: 8 },
+  readinessText: { color: '#e9e9ee', fontSize: 13, marginTop: 4 },
+  readinessWarn: { color: '#ffd08a', fontSize: 13, marginTop: 2, fontWeight: '700' },
+  readinessOk: { color: '#b8f7c7', fontSize: 13, marginTop: 2, fontWeight: '700' },
+  bold: { fontWeight: '900' },
+
+  captureBtn: { backgroundColor: '#151518', borderWidth: 1, borderColor: '#2a2a31', borderRadius: 12, paddingHorizontal: 10, paddingVertical: 8 },
+  captureBtnText: { color: '#fff', fontWeight: '800' },
+
+  pppHeader: { flexDirection: 'row', paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: '#23232a' },
+  pppCol: { color: '#a6a6ad', fontSize: 12, fontWeight: '800' },
+  pppCol1: { flex: 1.0, paddingRight: 8 },
+  pppCol2: { flex: 1.4, paddingRight: 8 },
+  pppCol3: { flex: 1.4, paddingRight: 8 },
+  pppCol4: { flex: 1.4, paddingRight: 8 },
+  pppCol5: { width: 92, textAlign: 'center' },
+
+  row: { flexDirection: 'row', paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: '#1f1f22' },
+  rowInactive: { opacity: 0.55 },
+
+  cell1: { flex: 1.0, paddingRight: 8, gap: 4 },
+  cell2: { flex: 1.4, paddingRight: 8 },
+  cell3: { flex: 1.4, paddingRight: 8 },
+  cell4: { flex: 1.4, paddingRight: 8 },
+  cell5: { width: 92, alignItems: 'center', justifyContent: 'center' },
+
+  taskName: { color: '#fff', fontSize: 13, fontWeight: '800' },
+  taskMeta: { color: '#a6a6ad', fontSize: 12, fontWeight: '600' },
+
+  badgeWarn: { alignSelf: 'flex-start', backgroundColor: '#2a2318', borderWidth: 1, borderColor: '#5b431f', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 999, color: '#ffd08a', fontSize: 11, fontWeight: '800' },
+  badgeMuted: { alignSelf: 'flex-start', backgroundColor: '#151518', borderWidth: 1, borderColor: '#2a2a31', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 999, color: '#bdbdc6', fontSize: 11, fontWeight: '800' },
+
+  lockedText: { color: '#d4d4d8', fontSize: 12, lineHeight: 16 },
+  plainText: { color: '#ffffff', fontSize: 12, lineHeight: 16 },
+
+  textArea: {
+    minHeight: 48,
+    maxHeight: 160,
     padding: 8,
-    borderRadius: 8,
-    backgroundColor: '#f7f7f7',
-    borderWidth: 1,
-    borderColor: '#ddd',
-  },
-  pastCycleTitle: {
-    fontSize: 14,
-    fontWeight: '700',
-  },
-  pastFieldText: {
-    fontSize: 13,
-    color: '#333',
-  },
-  selectorLabel: {
-    marginTop: 8,
-    fontSize: 13,
-    fontWeight: '600',
-    color: '#444',
-  },
-  pillRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 8,
-    marginTop: 4,
-    marginBottom: 4,
-    alignItems: 'center',
-  },
-  // Mode pills – pink active
-  modeRow: {
-    flexDirection: 'row',
-    gap: 8,
-    marginBottom: 8,
-    alignItems: 'center',
-  },
-  modePill: {
-    paddingVertical: 4,
-    paddingHorizontal: 8,
-    borderRadius: 999,
-    backgroundColor: '#e0e0e0',
-  },
-  modePillActive: {
-    backgroundColor: '#ffebf1',
-    borderWidth: 1,
-    borderColor: '#f8bbd0',
-  },
-  modePillText: {
-    fontSize: 12,
-    color: '#333',
-  },
-  modePillTextActive: {
-    color: '#880e4f',
-    fontWeight: '600',
-  },
-  // Help pill
-  helpPill: {
-    paddingVertical: 4,
-    paddingHorizontal: 8,
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: '#c5cae9',
-    backgroundColor: '#e8eaf6',
-  },
-  helpPillActive: {
-    backgroundColor: '#c5cae9',
-    borderColor: '#9fa8da',
-  },
-  helpPillText: {
-    fontSize: 12,
-    color: '#283593',
-  },
-  helpPillTextActive: {
-    fontWeight: '600',
-    color: '#1a237e',
-  },
-  // Advanced toggle
-  advancedToggle: {
-    paddingVertical: 4,
-    paddingHorizontal: 8,
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: '#ccc',
-    backgroundColor: '#fafafa',
-    marginLeft: 'auto',
-  },
-  advancedToggleActive: {
-    backgroundColor: '#fffde7',
-    borderColor: '#ffecb3',
-  },
-  advancedToggleText: {
-    fontSize: 12,
-    color: '#555',
-  },
-  advancedToggleTextActive: {
-    fontWeight: '600',
-    color: '#795548',
-  },
-  // Owner/filter pills
-  ownerPillRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 8,
-    marginTop: 4,
-    marginBottom: 4,
-  },
-  ownerPill: {
-    paddingVertical: 4,
-    paddingHorizontal: 10,
-    borderRadius: 999,
-    backgroundColor: '#e3f2fd',
-  },
-  ownerPillActive: {
-    backgroundColor: '#bbdefb',
-    borderWidth: 1,
-    borderColor: '#64b5f6',
-  },
-  ownerPillText: {
-    fontSize: 12,
-    color: '#0d47a1',
-  },
-  ownerPillTextActive: {
-    fontWeight: '600',
-  },
-  // Selector pills – green active, gold highlighted in owners view
-  selectorPill: {
-    paddingVertical: 4,
-    paddingHorizontal: 8,
-    borderRadius: 999,
-    backgroundColor: '#e0e0e0',
-    borderWidth: 1,
-    borderColor: 'transparent',
-  },
-  selectorPillActive: {
-    backgroundColor: '#c8e6c9',
-    borderColor: '#81c784',
-  },
-  selectorPillHighlighted: {
-    borderWidth: 2,
-    borderColor: '#fbc02d',
-  },
-  selectorPillDisabled: {
-    opacity: 0.4,
-  },
-  selectorPillText: {
-    fontSize: 12,
-    color: '#333',
-  },
-  selectorPillTextActive: {
-    color: '#1b5e20',
-    fontWeight: '600',
-  },
-  selectorPillTextDisabled: {
-    color: '#777',
-  },
-  
-  cadenceChipRow: {
-  flexDirection: 'row',
-  flexWrap: 'wrap',
-  gap: 6,
-  alignItems: 'center',
-},
-
-  
-  // Cadence table styles
-  pppHeaderRow: {
-    flexDirection: 'row',
-    marginTop: 8,
-    borderBottomWidth: 1,
-    borderColor: '#ddd',
-    paddingBottom: 4,
-  },
-  pppHeaderCell: {
-    flex: 1,
-    paddingHorizontal: 4,
-  },
-  pppObjectHeaderCell: {
-    flex: 1.2,
-  },
-  pppActionsHeaderCell: {
-    flex: 0.8,
-    alignItems: 'center',
-  },
-    pppHeaderText: {
-    fontSize: 15,          // bigger
-    fontWeight: '700',     // bolder
-    color: '#333',
-  },
-  pppHeaderSubText: {
-  fontSize: 14,
-  fontWeight: '600',
-  color: '#333',
-  backgroundColor: '#f3f6fa',  // light, subtle tint
-  paddingHorizontal: 0,
-  borderRadius: 4,
-  marginTop: 2,
-},
-
-
-    pppHeaderEditableTag: {
-    fontSize: 10,
-    fontWeight: '700',
-    color: '#2e7d32', // green
-    marginTop: 2,
-  },
-  pppHeaderLockedTag: {
-    fontSize: 10,
-    fontWeight: '700',
-    color: '#c62828', // red
-    marginTop: 2,
-  },
-
-  pppHeaderEditHint: {
-    fontSize: 10,
-    color: '#b26a00',      // subtle amber/orange hint
-    marginTop: 2,
-    fontStyle: 'italic',
-  },
-
-  pppRow: {
-    flexDirection: 'row',
-    marginTop: 6,
-  },
-  pppObjectCell: {
-    flex: 1.2,
-    borderWidth: 1,
-    borderColor: '#ccc',
-    borderRadius: 6,
-    padding: 6,
-    justifyContent: 'center',
-  },
-  pppObjectText: {
-    fontWeight: '600',
-  },
-  pppCell: {
-    flex: 1,
-    borderWidth: 1,
-    borderColor: '#ccc',
-    borderRadius: 6,
-    padding: 6,
-    marginLeft: 4,
-    justifyContent: 'center',
-  },
-  editableOutline: {
-    borderColor: '#81c784',
-    borderWidth: 1.5,
-  },
-  editableOutlineInput: {
-    borderColor: '#81c784',
-    borderWidth: 1.5,
-    borderRadius: 6,
-    paddingHorizontal: 6,
-    paddingVertical: 4,
-    marginTop: 4,
-  },
-  pppActionsCell: {
-    flex: 0.8,
-    marginLeft: 4,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  pppTextInput: {
-    fontSize: 13,
-    textAlignVertical: 'top',
-    minHeight: 40,
-  },
-  // Inline owner editing
-  ownerInline: {
-    fontSize: 11,
-    color: '#555',
-    marginTop: 2,
-  },
-  ownerInlineInput: {
-    fontSize: 11,
-    color: '#333',
-    marginTop: 4,
-    paddingVertical: 2,
-    paddingHorizontal: 4,
-    borderWidth: 1,
-    borderColor: '#ffe0b2',
-    borderRadius: 6,
-    backgroundColor: '#fff7e6',
-  },
-  // Complete Update button
-  completeUpdateButton: {
-    paddingVertical: 4,
-    paddingHorizontal: 8,
-    borderRadius: 6,
-    backgroundColor: '#c8e6c9',
-    borderWidth: 1,
-    borderColor: '#81c784',
-    marginBottom: 4,
-  },
-  completeUpdateButtonDisabled: {
-    backgroundColor: '#e0e0e0',
-    borderColor: '#bdbdbd',
-  },
-  completeUpdateButtonText: {
-    fontSize: 11,
-    color: '#1b5e20',
-    fontWeight: '600',
-  },
-  completeUpdateButtonTextDisabled: {
-    color: '#616161',
-  },
-  // Retire button
-  retireButton: {
-    paddingVertical: 3,
-    paddingHorizontal: 8,
-    borderRadius: 6,
-    backgroundColor: '#ffebee',
-    borderWidth: 1,
-    borderColor: '#ef9a9a',
-  },
-  retireButtonText: {
-    fontSize: 11,
-    color: '#b71c1c',
-    fontWeight: '600',
-  },
-  // Open summary bar
-  openSummaryBar: {
-    paddingVertical: 6,
-    paddingHorizontal: 8,
-    borderRadius: 8,
-    backgroundColor: '#e8f5e9',
-    marginBottom: 4,
-  },
-  openSummaryText: {
-    fontSize: 13,
-    fontWeight: '600',
-    color: '#1b5e20',
-  },
-  openSummaryHint: {
-    fontSize: 11,
-    color: '#4caf50',
-  },
-  // Cycle navigation row
-  cycleNavRow: {
-    marginTop: 6,
-    marginBottom: 4,
-    flexDirection: 'row',
-    justifyContent: 'flex-end',
-    alignItems: 'center',
-  },
-  cycleNavText: {
-    fontSize: 12,
-    color: '#555',
-  },
-  cycleNavButtons: {
-    flexDirection: 'row',
-    gap: 6,
-  },
-  cycleNavButton: {
-    paddingVertical: 3,
-    paddingHorizontal: 8,
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: '#ccc',
-    backgroundColor: '#f5f5f5',
-  },
-  cycleNavButtonDisabled: {
-    opacity: 0.4,
-  },
-  cycleNavButtonText: {
-    fontSize: 11,
-    color: '#333',
-  },
-  cycleNavButtonTextDisabled: {
-    color: '#777',
-  },
-  // Period footer
-  periodFooter: {
-    marginTop: 10,
-    borderTopWidth: 1,
-    borderTopColor: '#eee',
-    paddingTop: 8,
-  },
-  periodFooterText: {
-    fontSize: 12,
-    color: '#555',
-    marginBottom: 6,
-  },
-  completePeriodButton: {
-    alignSelf: 'flex-start',
-    paddingVertical: 6,
-    paddingHorizontal: 10,
-    borderRadius: 999,
-    backgroundColor: '#c5e1a5',
-    borderWidth: 1,
-    borderColor: '#9ccc65',
-  },
-  completePeriodButtonDisabled: {
-    backgroundColor: '#eeeeee',
-    borderColor: '#bdbdbd',
-  },
-  completePeriodButtonText: {
-    fontSize: 12,
-    fontWeight: '700',
-    color: '#33691e',
-  },
-  completePeriodButtonTextDisabled: {
-    color: '#757575',
-  },
-  // Add new pills
-  addPill: {
-    paddingVertical: 4,
-    paddingHorizontal: 10,
-    borderRadius: 999,
-    backgroundColor: '#ffe0b2',
-    borderWidth: 1,
-    borderColor: '#ffcc80',
-  },
-  addPillText: {
-    fontSize: 12,
-    color: '#e65100',
-    fontWeight: '600',
-  },
-  addPillDisabled: {
-    opacity: 0.5,
-    backgroundColor: '#f5f5f5',
-    borderColor: '#e0e0e0',
-  },
-
-  // Create rows
-  createRow: {
-    marginTop: 4,
-    marginBottom: 4,
-    padding: 8,
-    borderRadius: 8,
-    backgroundColor: '#fff3e0',
-    borderWidth: 1,
-    borderColor: '#ffe0b2',
-  },
-  createTextInput: {
-    fontSize: 13,
-    paddingVertical: 4,
-    paddingHorizontal: 6,
-    borderWidth: 1,
-    borderColor: '#ffcc80',
-    borderRadius: 6,
-    backgroundColor: '#ffffff',
-    marginBottom: 6,
-  },
-  createHelperText: {
-    fontSize: 12,
-    color: '#607d8b',
-    marginBottom: 6,
-  },
-  createActionsRow: {
-    flexDirection: 'row',
-    justifyContent: 'flex-end',
-    gap: 8,
-    marginTop: 4,
-  },
-  createActionPill: {
-    paddingVertical: 4,
-    paddingHorizontal: 12,
-    borderRadius: 999,
-    backgroundColor: '#ffe082',
-    borderWidth: 1,
-    borderColor: '#ffca28',
-    minWidth: 60,
-    alignItems: 'center',
-  },
-  createActionPillText: {
-    fontSize: 12,
-    fontWeight: '600',
-    color: '#e65100',
-  },
-  createActionPillSecondary: {
-    paddingVertical: 4,
-    paddingHorizontal: 12,
-    borderRadius: 999,
-    backgroundColor: '#fafafa',
-    borderWidth: 1,
-    borderColor: '#bdbdbd',
-    minWidth: 60,
-    alignItems: 'center',
-  },
-  createActionPillSecondaryText: {
-    fontSize: 12,
-    fontWeight: '600',
-    color: '#616161',
-  },
-  // Cadence picker
-  cadencePickerRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    alignItems: 'center',
-    gap: 6,
-    marginTop: 4,
-  },
-  cadencePickerLabel: {
-    fontSize: 12,
-    color: '#555',
-    marginRight: 4,
-  },
-  cadenceChip: {
-    paddingVertical: 2,
-    paddingHorizontal: 8,
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: '#ffcc80',
-    backgroundColor: '#fff8e1',
-  },
-  cadenceChipActive: {
-    backgroundColor: '#ffcc80',
-  },
-  cadenceChipText: {
-    fontSize: 11,
-    color: '#e65100',
-  },
-  cadenceChipTextActive: {
-    fontWeight: '600',
-    color: '#4e342e',
-  },
-  // Workstream milestone styles
-  milestoneRow: {
-    marginTop: 6,
-    paddingVertical: 4,
-    borderTopWidth: 1,
-    borderTopColor: '#eee',
-  },
-  milestoneWsName: {
-    fontSize: 13,
-    fontWeight: '600',
-    marginBottom: 2,
-  },
-  milestoneInput: {
-    fontSize: 13,
-    paddingVertical: 3,
-    paddingHorizontal: 6,
-    borderWidth: 1,
-    borderColor: '#cfd8dc',
-    borderRadius: 6,
-    backgroundColor: '#fafafa',
-    marginBottom: 4,
-  },
-  milestoneDateInput: {
-    fontSize: 12,
-    paddingVertical: 3,
-    paddingHorizontal: 6,
-    borderWidth: 1,
-    borderColor: '#cfd8dc',
-    borderRadius: 6,
-    backgroundColor: '#fafafa',
-    width: 120,
-  },
-    milestoneDateText: {
-    fontSize: 12,
-    color: '#333',
-  },
-
-  linkText: {
-    fontSize: 11,
-    color: '#1976d2',
-  },
-
-  // Inactive tasks UI
-  inactiveTasksBlock: {
-    marginLeft: 6,
-    marginTop: 6,
-  },
-  inactiveTasksToggle: {
-    paddingVertical: 4,
-    paddingHorizontal: 8,
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: '#cfd8dc',
-    backgroundColor: '#f5f5f5',
-    alignSelf: 'flex-start',
-  },
-  inactiveTasksToggleText: {
-    fontSize: 12,
-    color: '#455a64',
-    fontWeight: '600',
-  },
-  inactiveTasksPillRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    marginTop: 6,
-    gap: 6,
-  },
-  inactiveTaskPill: {
-    paddingVertical: 4,
-    paddingHorizontal: 8,
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: '#b0bec5',
-    backgroundColor: '#eeeeee',
-  },
-  inactiveTaskPillText: {
-    fontSize: 12,
-    color: '#455a64',
-  },
-
-  // Kebab menu button
-  kebabButton: {
-    marginTop: 6,
-    paddingVertical: 6,
-    paddingHorizontal: 10,
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: '#cfd8dc',
-    backgroundColor: '#fafafa',
-  },
-  kebabButtonSmall: {
-    marginLeft: 8,
-    paddingVertical: 4,
-    paddingHorizontal: 8,
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: '#cfd8dc',
-    backgroundColor: '#fafafa',
-    alignSelf: 'flex-start',
-  },
-  kebabButtonText: {
-    fontSize: 18,
-    fontWeight: '800',
-    color: '#455a64',
-    lineHeight: 18,
-  },
-
-  // Modal
-  modalOverlay: {
-    flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.25)',
-    justifyContent: 'center',
-    padding: 16,
-  },
-  modalCard: {
-    backgroundColor: '#fff',
     borderRadius: 12,
-    padding: 12,
+    backgroundColor: '#0e0e10',
     borderWidth: 1,
-    borderColor: '#e0e0e0',
-  },
-  modalTitle: {
-    fontSize: 16,
-    fontWeight: '800',
-    marginBottom: 8,
-  },
-  modalLabel: {
+    borderColor: '#26262d',
+    color: '#fff',
     fontSize: 12,
-    fontWeight: '700',
-    marginTop: 8,
-    marginBottom: 4,
-    color: '#333',
-  },
-  modalHelper: {
-    fontSize: 11,
-    color: '#666',
-    marginBottom: 6,
-  },
-  modalTextInput: {
-    borderWidth: 1,
-    borderColor: '#cfd8dc',
-    borderRadius: 8,
-    paddingHorizontal: 10,
-    paddingVertical: 8,
-    fontSize: 13,
-    backgroundColor: '#fafafa',
-  },
-  modalChipRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 6,
-    marginTop: 2,
-  },
-  modalChip: {
-    paddingVertical: 4,
-    paddingHorizontal: 8,
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: '#cfd8dc',
-    backgroundColor: '#f5f5f5',
-  },
-  modalChipActive: {
-    borderColor: '#81c784',
-    backgroundColor: '#c8e6c9',
-  },
-  modalChipText: {
-    fontSize: 12,
-    color: '#333',
-  },
-  modalChipTextActive: {
-    color: '#1b5e20',
-    fontWeight: '700',
-  },
-  modalButtonRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 8,
-    marginTop: 12,
-  },
-  modalPrimaryButton: {
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    borderRadius: 10,
-    backgroundColor: '#e3f2fd',
-    borderWidth: 1,
-    borderColor: '#90caf9',
-  },
-  modalPrimaryButtonText: {
-    fontSize: 12,
-    fontWeight: '800',
-    color: '#0d47a1',
-  },
-  modalSecondaryButton: {
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    borderRadius: 10,
-    backgroundColor: '#e8f5e9',
-    borderWidth: 1,
-    borderColor: '#81c784',
-  },
-  modalSecondaryButtonText: {
-    fontSize: 12,
-    fontWeight: '800',
-    color: '#1b5e20',
-  },
-  modalDangerButton: {
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    borderRadius: 10,
-    backgroundColor: '#ffebee',
-    borderWidth: 1,
-    borderColor: '#ef9a9a',
-  },
-  modalDangerButtonText: {
-    fontSize: 12,
-    fontWeight: '800',
-    color: '#b71c1c',
-  },
-  modalCancelButton: {
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    borderRadius: 10,
-    backgroundColor: '#eeeeee',
-    borderWidth: 1,
-    borderColor: '#cfd8dc',
-  },
-  modalCancelButtonText: {
-    fontSize: 12,
-    fontWeight: '700',
-    color: '#455a64',
+    lineHeight: 16,
   },
 
+  input: {
+    flex: 1,
+    padding: 10,
+    borderRadius: 12,
+    backgroundColor: '#0e0e10',
+    borderWidth: 1,
+    borderColor: '#26262d',
+    color: '#fff',
+  },
+
+  formRow: { flexDirection: 'row', gap: 10, alignItems: 'center', marginTop: 8, marginBottom: 8 },
+
+  primaryBtn: { backgroundColor: '#ffffff', paddingHorizontal: 12, paddingVertical: 10, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
+  primaryBtnDisabled: { opacity: 0.45 },
+  primaryBtnText: { color: '#0b0b0c', fontWeight: '900' },
+
+  secondaryBtn: { backgroundColor: '#151518', borderWidth: 1, borderColor: '#2a2a31', paddingHorizontal: 10, paddingVertical: 8, borderRadius: 12, marginLeft: 8 },
+  secondaryBtnText: { color: '#fff', fontWeight: '800', fontSize: 12 },
+
+  dangerBtn: { backgroundColor: '#2a1416', borderWidth: 1, borderColor: '#5b1f25', paddingHorizontal: 10, paddingVertical: 8, borderRadius: 12, marginTop: 8 },
+  dangerBtnText: { color: '#ffb4bd', fontWeight: '900', fontSize: 12 },
+
+  reviewBtn: { paddingHorizontal: 10, paddingVertical: 8, borderRadius: 12, borderWidth: 1, width: 84, alignItems: 'center' },
+  reviewBtnOn: { backgroundColor: '#122016', borderColor: '#255b31' },
+  reviewBtnOff: { backgroundColor: '#151518', borderColor: '#2a2a31' },
+  reviewBtnText: { color: '#fff', fontWeight: '900', fontSize: 12 },
+  mutedCenter: { color: '#a6a6ad', fontWeight: '800' },
+
+  manageTaskRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: '#1f1f22' },
 });
