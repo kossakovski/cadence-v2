@@ -21,6 +21,7 @@ import SetupScreen, { OnboardingV1 } from './screens/SetupScreen';
 type Cadence = 'daily' | 'weekly' | 'biweekly' | 'monthly' | 'quarterly';
 type Screen = 'meeting' | 'owners' | 'manage';
 type TaskLifecycle = 'active' | 'inactive';
+type MilestoneLifecycle = 'active' | 'inactive';
 
 interface Project {
   id: string;
@@ -34,8 +35,15 @@ interface Workstream {
   lead?: string;
   cadence: Cadence;
   firstCycleStartDate: string; // YYYY-MM-DD
-  milestone?: string;
-  milestoneDate?: string; // YYYY-MM-DD
+}
+
+interface Milestone {
+  id: string;
+  workstreamId: string;
+  title: string;
+  dueDate?: string; // YYYY-MM-DD
+  lifecycle: MilestoneLifecycle;
+  createdAt: string; // YYYY-MM-DD
 }
 
 interface Cycle {
@@ -53,6 +61,7 @@ interface Cycle {
 interface Task {
   id: string;
   workstreamId: string;
+  milestoneId?: string; // optional linkage (Manage only UI)
   name: string;
   owner: string;
   lifecycle: TaskLifecycle;
@@ -63,6 +72,7 @@ interface Task {
 interface AppState {
   projects: Project[];
   workstreams: Workstream[];
+  milestones: Milestone[];
   tasks: Task[];
   selectedProjectId?: string;
   selectedWorkstreamId?: string;
@@ -197,6 +207,10 @@ function uuid(): string {
   return `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function isISODateLike(s: string) {
+  return /^\d{4}-\d{2}-\d{2}$/.test((s || '').trim());
+}
+
 // ------------------------------
 // Hard rules
 // ------------------------------
@@ -225,7 +239,7 @@ function ensureTaskCyclesUpTo(
   firstStartISO: string,
   targetIndex: number
 ) {
-  const cycles = [...task.cycles].sort((a, b) => a.index - b.index);
+  const cycles = [...(task.cycles || [])].sort((a, b) => a.index - b.index);
 
   for (let i = 0; i <= targetIndex; i++) {
     const existing = cycles.find((c) => c.index === i);
@@ -274,6 +288,7 @@ function buildStateFromOnboarding(onb: OnboardingV1): AppState {
   const projects: Project[] = [{ id: projectId, name: safeTrim(proj0.name) || 'My project' }];
 
   const workstreams: Workstream[] = [];
+  const milestones: Milestone[] = [];
   const tasks: Task[] = [];
 
   for (const ws of proj0.workstreams || []) {
@@ -288,9 +303,21 @@ function buildStateFromOnboarding(onb: OnboardingV1): AppState {
       cadence,
       firstCycleStartDate,
       lead: safeTrim(ws.lead || '') || undefined,
-      milestone: safeTrim(ws.milestone || '') || undefined,
-      milestoneDate: safeTrim(ws.milestoneDate || '') || undefined,
     });
+
+    // If onboarding includes a single milestone, create it (back-compat)
+    const mTitle = safeTrim((ws as any).milestone || '');
+    const mDate = safeTrim((ws as any).milestoneDate || '');
+    if (mTitle) {
+      milestones.push({
+        id: uuid(),
+        workstreamId: wsId,
+        title: mTitle,
+        dueDate: isISODateLike(mDate) ? mDate : undefined,
+        lifecycle: 'active',
+        createdAt: todayISO,
+      });
+    }
 
     for (const t of ws.tasks || []) {
       const owner = safeTrim(t.owner || '') || 'Unassigned';
@@ -310,6 +337,7 @@ function buildStateFromOnboarding(onb: OnboardingV1): AppState {
   return {
     projects,
     workstreams,
+    milestones,
     tasks,
     selectedProjectId: projectId,
     selectedWorkstreamId,
@@ -331,9 +359,7 @@ function Pill({
 }) {
   return (
     <Pressable onPress={onPress} style={[styles.pill, active ? styles.pillActive : styles.pillInactive]}>
-      <Text style={[styles.pillText, active ? styles.pillTextActive : styles.pillTextInactive]}>
-        {label}
-      </Text>
+      <Text style={[styles.pillText, active ? styles.pillTextActive : styles.pillTextInactive]}>{label}</Text>
     </Pressable>
   );
 }
@@ -365,16 +391,25 @@ export default function App() {
   const [cycleOffset, setCycleOffset] = useState<number>(0);
   const [loading, setLoading] = useState(true);
 
+  // Global filter (applies to all screens)
+  const [ownerFilter, setOwnerFilter] = useState<string>('__ALL__'); // '__ALL__' | '__UNASSIGNED__' | ownerName
+
   const [newTaskName, setNewTaskName] = useState('');
   const [newTaskOwner, setNewTaskOwner] = useState('');
 
-  // Manage drafts
-  const [manageDraftProjectName, setManageDraftProjectName] = useState('');
+  // Manage drafts (workstream)
   const [manageDraftWorkstreamName, setManageDraftWorkstreamName] = useState('');
   const [manageDraftWorkstreamCadence, setManageDraftWorkstreamCadence] = useState<Cadence>('weekly');
-  const [manageDraftFirstCycleStart, setManageDraftFirstCycleStart] = useState(
-    toISODate(startOfWeekMonday(new Date()))
-  );
+  const [manageDraftFirstCycleStart, setManageDraftFirstCycleStart] = useState(toISODate(startOfWeekMonday(new Date())));
+
+  // Manage drafts (milestones)
+  const [manageDraftMilestoneTitle, setManageDraftMilestoneTitle] = useState('');
+  const [manageDraftMilestoneDue, setManageDraftMilestoneDue] = useState(''); // YYYY-MM-DD optional
+
+  // Manage drafts (tasks)
+  const [manageDraftTaskName, setManageDraftTaskName] = useState('');
+  const [manageDraftTaskOwner, setManageDraftTaskOwner] = useState('');
+  const [manageDraftTaskMilestoneId, setManageDraftTaskMilestoneId] = useState<string>(''); // '' => none
 
   // Setup
   const [needsSetup, setNeedsSetup] = useState(false);
@@ -383,6 +418,7 @@ export default function App() {
   const [showFollowUpBox, setShowFollowUpBox] = useState(false);
   const [followUpDraft, setFollowUpDraft] = useState('');
 
+  // --- Load / migrate state ---
   useEffect(() => {
     (async () => {
       try {
@@ -391,7 +427,25 @@ export default function App() {
           setNeedsSetup(true);
           setState(null);
         } else {
-          setState(JSON.parse(raw));
+          const parsed = JSON.parse(raw);
+
+          // Migrate: milestones + milestoneId
+          const migrated: AppState = {
+            projects: Array.isArray(parsed.projects) ? parsed.projects : [],
+            workstreams: Array.isArray(parsed.workstreams) ? parsed.workstreams : [],
+            tasks: Array.isArray(parsed.tasks)
+              ? parsed.tasks.map((t: any) => ({
+                  ...t,
+                  milestoneId: t.milestoneId || undefined,
+                  cycles: Array.isArray(t.cycles) ? t.cycles : [],
+                }))
+              : [],
+            milestones: Array.isArray(parsed.milestones) ? parsed.milestones : [],
+            selectedProjectId: parsed.selectedProjectId,
+            selectedWorkstreamId: parsed.selectedWorkstreamId,
+          };
+
+          setState(migrated);
         }
       } catch {
         setNeedsSetup(true);
@@ -431,6 +485,40 @@ export default function App() {
       .sort((a, b) => a.name.localeCompare(b.name));
   }, [state]);
 
+  const milestonesInSelectedWorkstream = useMemo(() => {
+    if (!state?.selectedWorkstreamId) return [];
+    return (state.milestones || [])
+      .filter((m) => m.workstreamId === state.selectedWorkstreamId)
+      .sort((a, b) => (a.dueDate || '9999-99-99').localeCompare(b.dueDate || '9999-99-99'));
+  }, [state]);
+
+  const activeMilestones = useMemo(
+    () => milestonesInSelectedWorkstream.filter((m) => m.lifecycle === 'active'),
+    [milestonesInSelectedWorkstream]
+  );
+
+  const milestoneById = useMemo(() => {
+    const map = new Map<string, Milestone>();
+    for (const m of state?.milestones || []) map.set(m.id, m);
+    return map;
+  }, [state]);
+
+  const ownerOptions = useMemo(() => {
+    const set = new Set<string>();
+    for (const t of tasksInSelectedWorkstream) {
+      const o = safeTrim(t.owner || '');
+      if (o) set.add(o);
+    }
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [tasksInSelectedWorkstream]);
+
+  // Auto-reset filter if selected workstream changes and filter no longer valid
+  useEffect(() => {
+    if (ownerFilter === '__ALL__' || ownerFilter === '__UNASSIGNED__') return;
+    if (!ownerOptions.includes(ownerFilter)) setOwnerFilter('__ALL__');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state?.selectedWorkstreamId]);
+
   const cycleInfo = useMemo(() => {
     if (!selectedWorkstream) return null;
     return getCycleForDate(todayISO, selectedWorkstream.firstCycleStartDate, selectedWorkstream.cadence);
@@ -461,6 +549,21 @@ export default function App() {
     return { curr, next };
   }, [selectedWorkstream, viewedCycleIndex]);
 
+  const milestoneSummary = useMemo(() => {
+    if (!selectedWorkstream) return null;
+    const active = activeMilestones;
+    if (active.length === 0) return null;
+
+    // pick soonest due (if any)
+    const withDue = active.filter((m) => !!m.dueDate).sort((a, b) => (a.dueDate || '').localeCompare(b.dueDate || ''));
+    const nextDue = withDue[0];
+
+    return {
+      count: active.length,
+      nextDue: nextDue ? `${nextDue.title}${nextDue.dueDate ? ` (by ${formatHumanDate(nextDue.dueDate)})` : ''}` : null,
+    };
+  }, [selectedWorkstream, activeMilestones]);
+
   // Ensure tasks have cycles up to current index
   useEffect(() => {
     if (!state || !selectedWorkstream || !cycleInfo) return;
@@ -469,7 +572,7 @@ export default function App() {
     let changed = false;
     const newTasks = state.tasks.map((t) => {
       if (t.workstreamId !== selectedWorkstream.id) return t;
-      const maxIdx = t.cycles.reduce((m, c) => Math.max(m, c.index), -1);
+      const maxIdx = (t.cycles || []).reduce((m, c) => Math.max(m, c.index), -1);
       if (maxIdx >= currentIndex) return t;
 
       changed = true;
@@ -489,13 +592,24 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state?.tasks?.length, selectedWorkstream?.id, cycleInfo?.currentIndex]);
 
+  const ownerPasses = (task: Task) => {
+    if (ownerFilter === '__ALL__') return true;
+    if (ownerFilter === '__UNASSIGNED__') {
+      return safeTrim(task.owner || '').length === 0 || safeTrim(task.owner) === 'Unassigned';
+    }
+    return safeTrim(task.owner || '') === ownerFilter;
+  };
+
   const viewedTasks = useMemo(() => {
     if (!selectedWorkstream) return [];
-    return tasksInSelectedWorkstream.map((t) => {
-      const cyc = t.cycles.find((c) => c.index === viewedCycleIndex);
-      return { task: t, cycle: cyc };
-    });
-  }, [tasksInSelectedWorkstream, selectedWorkstream, viewedCycleIndex]);
+    return tasksInSelectedWorkstream
+      .filter((t) => ownerPasses(t))
+      .map((t) => {
+        const cyc = (t.cycles || []).find((c) => c.index === viewedCycleIndex);
+        return { task: t, cycle: cyc };
+      });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tasksInSelectedWorkstream, selectedWorkstream, viewedCycleIndex, ownerFilter]);
 
   const activeViewed = useMemo(() => viewedTasks.filter((x) => x.task.lifecycle === 'active'), [viewedTasks]);
 
@@ -528,6 +642,7 @@ export default function App() {
     setNeedsSetup(false);
     setScreen('meeting');
     setCycleOffset(0);
+    setOwnerFilter('__ALL__');
   }
 
   // ------------------------------
@@ -539,12 +654,14 @@ export default function App() {
     const ws = state.workstreams.find((w) => w.projectId === projectId);
     setState({ ...state, selectedProjectId: projectId, selectedWorkstreamId: ws ? ws.id : undefined });
     setCycleOffset(0);
+    setOwnerFilter('__ALL__');
   }
 
   function setSelectedWorkstream(workstreamId: string) {
     if (!state) return;
     setState({ ...state, selectedWorkstreamId: workstreamId });
     setCycleOffset(0);
+    setOwnerFilter('__ALL__');
   }
 
   function updateCycleField(taskId: string, cycleIndex: number, patch: Partial<Cycle>) {
@@ -626,29 +743,21 @@ export default function App() {
     if (!state || !selectedWorkstream || !cycleInfo) return;
     if (!isMeetingActionsAllowed(screen)) return;
 
-    // Web: show inline input box (Alert.prompt doesn't work on web)
     if (Platform.OS === 'web') {
       setShowFollowUpBox(true);
       return;
     }
 
-    // iOS: prompt works
     Alert.prompt?.(
       'Capture follow-up',
       'Enter an action item (it will start next period).',
       [
         { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Add',
-          onPress: (text?: string) => {
-            actuallyAddFollowUp(text || '');
-          },
-        },
+        { text: 'Add', onPress: (text?: string) => actuallyAddFollowUp(text || '') },
       ],
       'plain-text'
     );
 
-    // Android fallback
     if (Platform.OS === 'android') {
       Alert.alert('Capture follow-up', 'On Android, please add follow-ups in Pre-meeting view for now.');
     }
@@ -678,20 +787,8 @@ export default function App() {
   }
 
   // ------------------------------
-  // Manage actions
+  // Manage actions: Workstreams
   // ------------------------------
-
-  function manageCreateProject() {
-    if (!state) return;
-    if (!isReorgAllowed(screen)) return;
-
-    const name = safeTrim(manageDraftProjectName);
-    if (!name) return;
-
-    const p: Project = { id: uuid(), name };
-    setState({ ...state, projects: [...state.projects, p], selectedProjectId: p.id, selectedWorkstreamId: undefined });
-    setManageDraftProjectName('');
-  }
 
   function manageCreateWorkstream() {
     if (!state || !state.selectedProjectId) return;
@@ -710,6 +807,113 @@ export default function App() {
 
     setState({ ...state, workstreams: [...state.workstreams, ws], selectedWorkstreamId: ws.id });
     setManageDraftWorkstreamName('');
+    setOwnerFilter('__ALL__');
+  }
+
+  // ------------------------------
+  // Manage actions: Milestones
+  // ------------------------------
+
+  function manageCreateMilestone() {
+    if (!state || !state.selectedWorkstreamId) return;
+    if (!isReorgAllowed(screen)) return;
+
+    const title = safeTrim(manageDraftMilestoneTitle);
+    if (!title) return;
+
+    const due = safeTrim(manageDraftMilestoneDue);
+    const today = toISODate(new Date());
+
+    const m: Milestone = {
+      id: uuid(),
+      workstreamId: state.selectedWorkstreamId,
+      title,
+      dueDate: due && isISODateLike(due) ? due : undefined,
+      lifecycle: 'active',
+      createdAt: today,
+    };
+
+    setState({ ...state, milestones: [...(state.milestones || []), m] });
+    setManageDraftMilestoneTitle('');
+    setManageDraftMilestoneDue('');
+  }
+
+  function manageUpdateMilestone(milestoneId: string, patch: Partial<Milestone>) {
+    if (!state) return;
+    if (!isReorgAllowed(screen)) return;
+    setState({
+      ...state,
+      milestones: (state.milestones || []).map((m) => (m.id === milestoneId ? { ...m, ...patch } : m)),
+    });
+  }
+
+  function manageRetireMilestone(milestoneId: string) {
+    if (!state) return;
+    if (!isReorgAllowed(screen)) return;
+
+    // Retire milestone AND clear it from any tasks that point to it (avoid dangling refs)
+    setState({
+      ...state,
+      milestones: (state.milestones || []).map((m) => (m.id === milestoneId ? { ...m, lifecycle: 'inactive' } : m)),
+      tasks: state.tasks.map((t) => (t.milestoneId === milestoneId ? { ...t, milestoneId: undefined } : t)),
+    });
+  }
+
+  function manageReactivateMilestone(milestoneId: string) {
+    manageUpdateMilestone(milestoneId, { lifecycle: 'active' });
+  }
+
+  // ------------------------------
+  // Manage actions: Tasks
+  // ------------------------------
+
+  function manageCreateTask() {
+    if (!state || !state.selectedWorkstreamId) return;
+    if (!isReorgAllowed(screen)) return;
+
+    const name = safeTrim(manageDraftTaskName);
+    if (!name) return;
+
+    const owner = safeTrim(manageDraftTaskOwner) || 'Unassigned';
+    const milestoneId = safeTrim(manageDraftTaskMilestoneId);
+    const pickedMilestoneId = milestoneId ? milestoneId : undefined;
+
+    // guard: only allow linking to ACTIVE milestones
+    if (pickedMilestoneId) {
+      const m = milestoneById.get(pickedMilestoneId);
+      if (!m || m.lifecycle !== 'active') return;
+    }
+
+    const today = toISODate(new Date());
+    let task: Task = {
+      id: uuid(),
+      workstreamId: state.selectedWorkstreamId,
+      milestoneId: pickedMilestoneId,
+      name,
+      owner,
+      lifecycle: 'active',
+      cycles: [],
+      createdAt: today,
+    };
+
+    // If we have selectedWorkstream + cycleInfo, pre-create cycles up to CURRENT index
+    if (selectedWorkstream && cycleInfo) {
+      task = {
+        ...task,
+        cycles: ensureTaskCyclesUpTo(
+          task,
+          owner,
+          selectedWorkstream.cadence,
+          selectedWorkstream.firstCycleStartDate,
+          cycleInfo.currentIndex
+        ),
+      };
+    }
+
+    setState({ ...state, tasks: [...state.tasks, task] });
+    setManageDraftTaskName('');
+    setManageDraftTaskOwner('');
+    setManageDraftTaskMilestoneId('');
   }
 
   function manageRenameTask(taskId: string, newName: string) {
@@ -726,6 +930,22 @@ export default function App() {
     setState({
       ...state,
       tasks: state.tasks.map((t) => (t.id === taskId ? { ...t, owner: safeTrim(owner) || 'Unassigned' } : t)),
+    });
+  }
+
+  function manageSetTaskMilestone(taskId: string, milestoneId?: string) {
+    if (!state) return;
+    if (!isReorgAllowed(screen)) return;
+
+    // Only allow assigning to active milestones (or none)
+    if (milestoneId) {
+      const m = milestoneById.get(milestoneId);
+      if (!m || m.lifecycle !== 'active') return;
+    }
+
+    setState({
+      ...state,
+      tasks: state.tasks.map((t) => (t.id === taskId ? { ...t, milestoneId } : t)),
     });
   }
 
@@ -752,6 +972,43 @@ export default function App() {
   // Render helpers
   // ------------------------------
 
+  function renderOwnerFilter() {
+    if (!state?.selectedWorkstreamId) return null;
+
+    const allCount = tasksInSelectedWorkstream.filter((t) => t.lifecycle === 'active').length;
+    const unassignedCount = tasksInSelectedWorkstream.filter(
+      (t) => t.lifecycle === 'active' && (safeTrim(t.owner) === '' || safeTrim(t.owner) === 'Unassigned')
+    ).length;
+
+    return (
+      <View style={{ marginTop: 10, gap: 6 }}>
+        <SmallMuted>Owner</SmallMuted>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+          <View style={styles.inlineRow}>
+            <Pill
+              label={`All (${allCount})`}
+              active={ownerFilter === '__ALL__'}
+              onPress={() => setOwnerFilter('__ALL__')}
+            />
+            <Pill
+              label={`Unassigned (${unassignedCount})`}
+              active={ownerFilter === '__UNASSIGNED__'}
+              onPress={() => setOwnerFilter('__UNASSIGNED__')}
+            />
+            {ownerOptions.map((o) => {
+              const count = tasksInSelectedWorkstream.filter(
+                (t) => t.lifecycle === 'active' && safeTrim(t.owner) === o
+              ).length;
+              return (
+                <Pill key={o} label={`${o} (${count})`} active={ownerFilter === o} onPress={() => setOwnerFilter(o)} />
+              );
+            })}
+          </View>
+        </ScrollView>
+      </View>
+    );
+  }
+
   function renderTopNav() {
     return (
       <View style={styles.topNav}>
@@ -759,7 +1016,6 @@ export default function App() {
           <Text style={styles.appTitle}>Cadence</Text>
           <View style={styles.topNavPills}>
             <Pill label="Meeting" active={screen === 'meeting'} onPress={() => setScreen('meeting')} />
-            {/* Rename label only (keep internal screen key 'owners') */}
             <Pill label="Pre-meeting" active={screen === 'owners'} onPress={() => setScreen('owners')} />
             <Pill label="Manage" active={screen === 'manage'} onPress={() => setScreen('manage')} />
           </View>
@@ -797,6 +1053,8 @@ export default function App() {
               </View>
             </ScrollView>
           </View>
+
+          {renderOwnerFilter()}
         </View>
       </View>
     );
@@ -828,12 +1086,14 @@ export default function App() {
           </Text>
           <Text style={styles.periodSub}>{viewedPeriodLabel}</Text>
 
-          {selectedWorkstream.milestone ? (
+          {milestoneSummary ? (
             <Text style={styles.periodHint}>
-              Milestone: {selectedWorkstream.milestone}
-              {selectedWorkstream.milestoneDate ? ` (by ${selectedWorkstream.milestoneDate})` : ''}
+              Milestones: {milestoneSummary.count}
+              {milestoneSummary.nextDue ? ` • Next: ${milestoneSummary.nextDue}` : ''}
             </Text>
-          ) : null}
+          ) : (
+            <Text style={styles.periodHint}>Milestones: none yet (add in Manage)</Text>
+          )}
 
           {screen === 'meeting' && cycleOffset === 0 ? (
             <Text style={styles.periodHint}>Expectation: owners update before the meeting.</Text>
@@ -890,7 +1150,7 @@ export default function App() {
       <View key={task.id} style={[styles.row, task.lifecycle !== 'active' ? styles.rowInactive : null]}>
         <View style={styles.cell1}>
           <Text style={styles.taskName}>{task.name}</Text>
-          <Text style={styles.taskMeta}>{task.owner || 'Unassigned'}</Text>
+          <Text style={styles.taskMeta}>{safeTrim(task.owner) ? task.owner : 'Unassigned'}</Text>
           {showNotUpdated ? <Text style={styles.badgeWarn}>Not updated yet</Text> : null}
           {task.lifecycle !== 'active' ? <Text style={styles.badgeMuted}>Inactive</Text> : null}
         </View>
@@ -984,7 +1244,6 @@ export default function App() {
                 </Pressable>
                 <SmallMuted>Starts next period</SmallMuted>
 
-                {/* Web-only follow-up capture box */}
                 {Platform.OS === 'web' && showFollowUpBox ? (
                   <View style={styles.followUpBox}>
                     <TextInput
@@ -1046,7 +1305,7 @@ export default function App() {
             }
           />
           {renderPPPHeader()}
-          {activeRows.length === 0 ? <Text style={styles.smallMuted}>No active tasks.</Text> : null}
+          {activeRows.length === 0 ? <Text style={styles.smallMuted}>No active tasks (for this owner filter).</Text> : null}
           {activeRows.map(renderTaskRow)}
           {cycleOffset === 0 && !allReviewedCurrent ? (
             <Text style={styles.helpText}>To close: mark all active items as reviewed.</Text>
@@ -1090,7 +1349,12 @@ export default function App() {
 
           <View style={styles.formRow}>
             <TextInput value={newTaskName} onChangeText={setNewTaskName} placeholder="Task name" style={styles.input} />
-            <TextInput value={newTaskOwner} onChangeText={setNewTaskOwner} placeholder="Owner (optional)" style={styles.input} />
+            <TextInput
+              value={newTaskOwner}
+              onChangeText={setNewTaskOwner}
+              placeholder="Owner (optional)"
+              style={styles.input}
+            />
           </View>
 
           <Pressable
@@ -1105,7 +1369,7 @@ export default function App() {
         <Card>
           <SectionTitle title={isPast ? 'Past period (read-only)' : 'Update your items'} />
           {renderPPPHeader()}
-          {activeRows.length === 0 ? <Text style={styles.smallMuted}>No active tasks.</Text> : null}
+          {activeRows.length === 0 ? <Text style={styles.smallMuted}>No active tasks (for this owner filter).</Text> : null}
           {activeRows.map(renderTaskRow)}
           {isPast ? <Text style={styles.helpText}>Past periods are locked.</Text> : null}
         </Card>
@@ -1116,35 +1380,32 @@ export default function App() {
   function renderManage() {
     if (!state) return null;
 
-    const allTasksInWS = state.selectedWorkstreamId
-      ? state.tasks.filter((t) => t.workstreamId === state.selectedWorkstreamId).sort((a, b) => a.name.localeCompare(b.name))
+    const wsId = state.selectedWorkstreamId;
+
+    const allTasksInWS = wsId
+      ? state.tasks
+          .filter((t) => t.workstreamId === wsId)
+          .filter((t) => ownerPasses(t))
+          .sort((a, b) => a.name.localeCompare(b.name))
       : [];
 
-    const active = allTasksInWS.filter((t) => t.lifecycle === 'active');
-    const inactive = allTasksInWS.filter((t) => t.lifecycle !== 'active');
+    const activeTasks = allTasksInWS.filter((t) => t.lifecycle === 'active');
+    const inactiveTasks = allTasksInWS.filter((t) => t.lifecycle !== 'active');
+
+    const activeMs = activeMilestones;
+    const inactiveMs = milestonesInSelectedWorkstream.filter((m) => m.lifecycle !== 'active');
 
     return (
       <>
         <Card>
           <Text style={styles.h2}>Manage (Backstage)</Text>
-          <SmallMuted>Reorganization happens only here: rename, owner changes, retire/reactivate, workstream creation.</SmallMuted>
+          <SmallMuted>
+            Reorganization happens only here: milestones, create/rename tasks, owner changes, retire/reactivate,
+            task→milestone linking.
+          </SmallMuted>
           <View style={{ marginTop: 10 }}>
             <Pressable style={styles.dangerBtn} onPress={manageResetToSetup}>
               <Text style={styles.dangerBtnText}>Reset / run Setup Wizard</Text>
-            </Pressable>
-          </View>
-        </Card>
-
-        <Card>
-          <SectionTitle title="Create project" />
-          <View style={styles.formRow}>
-            <TextInput value={manageDraftProjectName} onChangeText={setManageDraftProjectName} placeholder="Project name" style={styles.input} />
-            <Pressable
-              style={[styles.primaryBtn, safeTrim(manageDraftProjectName).length === 0 ? styles.primaryBtnDisabled : null]}
-              onPress={manageCreateProject}
-              disabled={safeTrim(manageDraftProjectName).length === 0}
-            >
-              <Text style={styles.primaryBtnText}>Create</Text>
             </Pressable>
           </View>
         </Card>
@@ -1154,12 +1415,22 @@ export default function App() {
           <SmallMuted>Cadence is defined at the workstream level (tasks inherit).</SmallMuted>
 
           <View style={styles.formRow}>
-            <TextInput value={manageDraftWorkstreamName} onChangeText={setManageDraftWorkstreamName} placeholder="Workstream name" style={styles.input} />
+            <TextInput
+              value={manageDraftWorkstreamName}
+              onChangeText={setManageDraftWorkstreamName}
+              placeholder="Workstream name"
+              style={styles.input}
+            />
           </View>
 
           <View style={styles.inlineRow}>
             {(['daily', 'weekly', 'biweekly', 'monthly', 'quarterly'] as Cadence[]).map((c) => (
-              <Pill key={c} label={c} active={manageDraftWorkstreamCadence === c} onPress={() => setManageDraftWorkstreamCadence(c)} />
+              <Pill
+                key={c}
+                label={c}
+                active={manageDraftWorkstreamCadence === c}
+                onPress={() => setManageDraftWorkstreamCadence(c)}
+              />
             ))}
           </View>
 
@@ -1182,55 +1453,284 @@ export default function App() {
         </Card>
 
         <Card>
-          <SectionTitle title="Tasks (reorg allowed here only)" />
-          {!state.selectedWorkstreamId ? <SmallMuted>Select a workstream above.</SmallMuted> : null}
+          <SectionTitle title="Milestones" />
+          {!wsId ? <SmallMuted>Select a workstream above.</SmallMuted> : null}
 
-          {active.length > 0 ? <Text style={styles.h3}>Active</Text> : null}
-          {active.map((t) => (
-            <View key={t.id} style={styles.manageTaskRow}>
-              <View style={{ flex: 1 }}>
-                <Text style={styles.taskName}>{t.name}</Text>
-                <Text style={styles.taskMeta}>Owner: {t.owner || 'Unassigned'}</Text>
+          {wsId ? (
+            <>
+              <SmallMuted>
+                Add milestones here. Task→milestone linking is also done here (below) to avoid clutter elsewhere.
+              </SmallMuted>
+
+              <View style={styles.formRow}>
+                <TextInput
+                  value={manageDraftMilestoneTitle}
+                  onChangeText={setManageDraftMilestoneTitle}
+                  placeholder="Milestone title"
+                  style={styles.input}
+                />
+                <TextInput
+                  value={manageDraftMilestoneDue}
+                  onChangeText={setManageDraftMilestoneDue}
+                  placeholder="Due date (YYYY-MM-DD, optional)"
+                  style={styles.input}
+                  autoCapitalize="none"
+                />
               </View>
 
               <Pressable
-                style={styles.secondaryBtn}
-                onPress={() => {
-                  Alert.prompt?.('Rename task', 'New name:', [
-                    { text: 'Cancel', style: 'cancel' },
-                    { text: 'Save', onPress: (text?: string) => manageRenameTask(t.id, text || '') },
-                  ]);
-                  if (Platform.OS === 'android') Alert.alert('Rename', 'Android: rename prompt not available in this MVP.');
-                }}
+                style={[styles.primaryBtn, safeTrim(manageDraftMilestoneTitle).length === 0 ? styles.primaryBtnDisabled : null]}
+                onPress={manageCreateMilestone}
+                disabled={safeTrim(manageDraftMilestoneTitle).length === 0}
               >
-                <Text style={styles.secondaryBtnText}>Rename</Text>
+                <Text style={styles.primaryBtnText}>Add milestone</Text>
               </Pressable>
+
+              {activeMs.length > 0 ? <Text style={styles.h3}>Active</Text> : null}
+              {activeMs.map((m) => (
+                <View key={m.id} style={styles.manageTaskRow}>
+                  <View style={{ flex: 1, gap: 6 }}>
+                    {Platform.OS === 'web' ? (
+                      <>
+                        <TextInput
+                          value={m.title}
+                          onChangeText={(t) => manageUpdateMilestone(m.id, { title: safeTrim(t) || m.title })}
+                          style={styles.input}
+                        />
+                        <TextInput
+                          value={m.dueDate || ''}
+                          onChangeText={(t) =>
+                            manageUpdateMilestone(m.id, {
+                              dueDate: safeTrim(t) && isISODateLike(t) ? safeTrim(t) : undefined,
+                            })
+                          }
+                          placeholder="Due date (YYYY-MM-DD)"
+                          style={styles.input}
+                          autoCapitalize="none"
+                        />
+                        <SmallMuted>Edits save immediately on web.</SmallMuted>
+                      </>
+                    ) : (
+                      <>
+                        <Text style={styles.taskName}>{m.title}</Text>
+                        <Text style={styles.taskMeta}>Due: {m.dueDate ? formatHumanDate(m.dueDate) : '—'}</Text>
+                      </>
+                    )}
+                  </View>
+
+                  {Platform.OS !== 'web' ? (
+                    <>
+                      <Pressable
+                        style={styles.secondaryBtn}
+                        onPress={() => {
+                          Alert.prompt?.('Rename milestone', 'New title:', [
+                            { text: 'Cancel', style: 'cancel' },
+                            {
+                              text: 'Save',
+                              onPress: (text?: string) =>
+                                manageUpdateMilestone(m.id, { title: safeTrim(text || '') || m.title }),
+                            },
+                          ]);
+                          if (Platform.OS === 'android') Alert.alert('Rename', 'Android: prompt not available in this MVP.');
+                        }}
+                      >
+                        <Text style={styles.secondaryBtnText}>Rename</Text>
+                      </Pressable>
+
+                      <Pressable
+                        style={styles.secondaryBtn}
+                        onPress={() => {
+                          Alert.prompt?.('Milestone due date', 'YYYY-MM-DD (leave blank to clear):', [
+                            { text: 'Cancel', style: 'cancel' },
+                            {
+                              text: 'Save',
+                              onPress: (text?: string) => {
+                                const v = safeTrim(text || '');
+                                manageUpdateMilestone(m.id, { dueDate: v && isISODateLike(v) ? v : undefined });
+                              },
+                            },
+                          ]);
+                          if (Platform.OS === 'android') Alert.alert('Due date', 'Android: prompt not available in this MVP.');
+                        }}
+                      >
+                        <Text style={styles.secondaryBtnText}>Due</Text>
+                      </Pressable>
+                    </>
+                  ) : null}
+
+                  <Pressable style={styles.dangerBtn} onPress={() => manageRetireMilestone(m.id)}>
+                    <Text style={styles.dangerBtnText}>Retire</Text>
+                  </Pressable>
+                </View>
+              ))}
+
+              {inactiveMs.length > 0 ? <Text style={styles.h3}>Inactive</Text> : null}
+              {inactiveMs.map((m) => (
+                <View key={m.id} style={styles.manageTaskRow}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.taskName}>{m.title}</Text>
+                    <Text style={styles.taskMeta}>Due: {m.dueDate ? formatHumanDate(m.dueDate) : '—'}</Text>
+                    <Text style={styles.badgeMuted}>Inactive</Text>
+                  </View>
+                  <Pressable style={styles.secondaryBtn} onPress={() => manageReactivateMilestone(m.id)}>
+                    <Text style={styles.secondaryBtnText}>Reactivate</Text>
+                  </Pressable>
+                </View>
+              ))}
+            </>
+          ) : null}
+        </Card>
+
+        <Card>
+          <SectionTitle title="Create task (Manage)" />
+          {!wsId ? (
+            <SmallMuted>Select a workstream above.</SmallMuted>
+          ) : (
+            <>
+              <SmallMuted>Create tasks here (essential for MVP). You can optionally link to a milestone.</SmallMuted>
+
+              <View style={styles.formRow}>
+                <TextInput
+                  value={manageDraftTaskName}
+                  onChangeText={setManageDraftTaskName}
+                  placeholder="Task name"
+                  style={styles.input}
+                />
+                <TextInput
+                  value={manageDraftTaskOwner}
+                  onChangeText={setManageDraftTaskOwner}
+                  placeholder="Owner (optional)"
+                  style={styles.input}
+                />
+              </View>
+
+              <SmallMuted>Milestone (optional)</SmallMuted>
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginTop: 6 }}>
+                <View style={styles.inlineRow}>
+                  <Pill
+                    label="None"
+                    active={safeTrim(manageDraftTaskMilestoneId).length === 0}
+                    onPress={() => setManageDraftTaskMilestoneId('')}
+                  />
+                  {activeMilestones.map((m) => (
+                    <Pill
+                      key={m.id}
+                      label={m.title}
+                      active={manageDraftTaskMilestoneId === m.id}
+                      onPress={() => setManageDraftTaskMilestoneId(m.id)}
+                    />
+                  ))}
+                </View>
+              </ScrollView>
 
               <Pressable
-                style={styles.secondaryBtn}
-                onPress={() => {
-                  Alert.prompt?.('Change owner', 'Owner name:', [
-                    { text: 'Cancel', style: 'cancel' },
-                    { text: 'Save', onPress: (text?: string) => manageChangeOwner(t.id, text || '') },
-                  ]);
-                  if (Platform.OS === 'android') Alert.alert('Owner', 'Android: owner prompt not available in this MVP.');
-                }}
+                style={[styles.primaryBtn, safeTrim(manageDraftTaskName).length === 0 ? styles.primaryBtnDisabled : null]}
+                onPress={manageCreateTask}
+                disabled={safeTrim(manageDraftTaskName).length === 0}
               >
-                <Text style={styles.secondaryBtnText}>Owner</Text>
+                <Text style={styles.primaryBtnText}>Add task</Text>
               </Pressable>
+            </>
+          )}
+        </Card>
 
-              <Pressable style={styles.dangerBtn} onPress={() => manageRetireTask(t.id)}>
-                <Text style={styles.dangerBtnText}>Retire</Text>
-              </Pressable>
-            </View>
-          ))}
+        <Card>
+          <SectionTitle title="Tasks (reorg allowed here only)" />
+          {!wsId ? <SmallMuted>Select a workstream above.</SmallMuted> : null}
 
-          {inactive.length > 0 ? <Text style={styles.h3}>Inactive</Text> : null}
-          {inactive.map((t) => (
+          {activeTasks.length > 0 ? <Text style={styles.h3}>Active</Text> : null}
+          {activeTasks.map((t) => {
+            const assigned = t.milestoneId ? milestoneById.get(t.milestoneId) : undefined;
+            return (
+              <View key={t.id} style={styles.manageTaskRow}>
+                <View style={{ flex: 1, gap: 6 }}>
+                  {Platform.OS === 'web' ? (
+                    <>
+                      <TextInput
+                        value={t.name}
+                        onChangeText={(txt) => manageRenameTask(t.id, txt)}
+                        style={styles.input}
+                        placeholder="Task name"
+                      />
+                      <TextInput
+                        value={t.owner}
+                        onChangeText={(txt) => manageChangeOwner(t.id, txt)}
+                        style={styles.input}
+                        placeholder="Owner"
+                      />
+                    </>
+                  ) : (
+                    <>
+                      <Text style={styles.taskName}>{t.name}</Text>
+                      <Text style={styles.taskMeta}>Owner: {safeTrim(t.owner) ? t.owner : 'Unassigned'}</Text>
+                    </>
+                  )}
+
+                  <View style={{ gap: 6 }}>
+                    <SmallMuted>Milestone (Manage-only)</SmallMuted>
+                    <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+                      <View style={styles.inlineRow}>
+                        <Pill label="None" active={!t.milestoneId} onPress={() => manageSetTaskMilestone(t.id, undefined)} />
+                        {activeMilestones.map((m) => (
+                          <Pill
+                            key={m.id}
+                            label={m.title}
+                            active={t.milestoneId === m.id}
+                            onPress={() => manageSetTaskMilestone(t.id, m.id)}
+                          />
+                        ))}
+                      </View>
+                    </ScrollView>
+                    {assigned && assigned.lifecycle !== 'active' ? (
+                      <Text style={styles.badgeWarn}>Assigned milestone is inactive (auto-cleared when retiring)</Text>
+                    ) : null}
+                  </View>
+                </View>
+
+                {Platform.OS !== 'web' ? (
+                  <>
+                    <Pressable
+                      style={styles.secondaryBtn}
+                      onPress={() => {
+                        Alert.prompt?.('Rename task', 'New name:', [
+                          { text: 'Cancel', style: 'cancel' },
+                          { text: 'Save', onPress: (text?: string) => manageRenameTask(t.id, text || '') },
+                        ]);
+                        if (Platform.OS === 'android') Alert.alert('Rename', 'Android: rename prompt not available in this MVP.');
+                      }}
+                    >
+                      <Text style={styles.secondaryBtnText}>Rename</Text>
+                    </Pressable>
+
+                    <Pressable
+                      style={styles.secondaryBtn}
+                      onPress={() => {
+                        Alert.prompt?.('Change owner', 'Owner name:', [
+                          { text: 'Cancel', style: 'cancel' },
+                          { text: 'Save', onPress: (text?: string) => manageChangeOwner(t.id, text || '') },
+                        ]);
+                        if (Platform.OS === 'android') Alert.alert('Owner', 'Android: owner prompt not available in this MVP.');
+                      }}
+                    >
+                      <Text style={styles.secondaryBtnText}>Owner</Text>
+                    </Pressable>
+                  </>
+                ) : null}
+
+                <Pressable style={styles.dangerBtn} onPress={() => manageRetireTask(t.id)}>
+                  <Text style={styles.dangerBtnText}>Retire</Text>
+                </Pressable>
+              </View>
+            );
+          })}
+
+          {inactiveTasks.length > 0 ? <Text style={styles.h3}>Inactive</Text> : null}
+          {inactiveTasks.map((t) => (
             <View key={t.id} style={styles.manageTaskRow}>
               <View style={{ flex: 1 }}>
                 <Text style={styles.taskName}>{t.name}</Text>
-                <Text style={styles.taskMeta}>Owner: {t.owner || 'Unassigned'}</Text>
+                <Text style={styles.taskMeta}>Owner: {safeTrim(t.owner) ? t.owner : 'Unassigned'}</Text>
+                <Text style={styles.badgeMuted}>Inactive</Text>
               </View>
               <Pressable style={styles.secondaryBtn} onPress={() => manageReactivateTask(t.id)}>
                 <Text style={styles.secondaryBtnText}>Reactivate</Text>
@@ -1290,7 +1790,6 @@ const MUTED = '#5b5b66';
 const BORDER = '#e6dcc7';
 const CARD = '#fffdf6';
 const SOFT = '#f3ead6';
-const BTN = '#1b1b1e';
 const BTN_TEXT = '#fbf6ea';
 
 const styles = StyleSheet.create({
@@ -1322,7 +1821,7 @@ const styles = StyleSheet.create({
 
   h1: { color: INK, fontSize: 18, fontWeight: '900' },
   h2: { color: INK, fontSize: 16, fontWeight: '900' },
-  h3: { color: INK, fontSize: 14, fontWeight: '900', marginTop: 6, marginBottom: 6 },
+  h3: { color: INK, fontSize: 14, fontWeight: '900', marginTop: 10, marginBottom: 6 },
 
   smallMuted: { color: MUTED, fontSize: 12, lineHeight: 16 },
   helpText: { color: MUTED, fontSize: 12, marginTop: 8 },
@@ -1343,7 +1842,7 @@ const styles = StyleSheet.create({
   periodCenter: { flex: 1, alignItems: 'center', gap: 2 },
   periodTitle: { color: INK, fontSize: 16, fontWeight: '900' },
   periodSub: { color: INK, fontSize: 13, fontWeight: '700' },
-  periodHint: { color: MUTED, fontSize: 12 },
+  periodHint: { color: MUTED, fontSize: 12, textAlign: 'center' },
 
   readinessRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12, marginBottom: 8 },
   readinessText: { color: INK, fontSize: 13, marginTop: 4 },
@@ -1355,14 +1854,7 @@ const styles = StyleSheet.create({
   captureBtnText: { color: BTN_TEXT, fontWeight: '900' },
 
   followUpBox: { marginTop: 10, width: 260 },
-  followUpInput: {
-    padding: 10,
-    borderRadius: 12,
-    backgroundColor: PAPER,
-    borderWidth: 1,
-    borderColor: BORDER,
-    color: INK,
-  },
+  followUpInput: { padding: 10, borderRadius: 12, backgroundColor: PAPER, borderWidth: 1, borderColor: BORDER, color: INK },
   followUpRow: { flexDirection: 'row', gap: 8, marginTop: 8, justifyContent: 'flex-end' },
 
   pppHeader: { flexDirection: 'row', paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: BORDER },
@@ -1426,26 +1918,41 @@ const styles = StyleSheet.create({
     lineHeight: 16,
   },
 
-  input: {
-    flex: 1,
-    padding: 10,
-    borderRadius: 12,
-    backgroundColor: PAPER,
-    borderWidth: 1,
-    borderColor: BORDER,
-    color: INK,
-  },
+  input: { flex: 1, padding: 10, borderRadius: 12, backgroundColor: PAPER, borderWidth: 1, borderColor: BORDER, color: INK },
 
   formRow: { flexDirection: 'row', gap: 10, alignItems: 'center', marginTop: 8, marginBottom: 8 },
 
-  primaryBtn: { backgroundColor: INK, paddingHorizontal: 12, paddingVertical: 10, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
+  primaryBtn: {
+    backgroundColor: INK,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderRadius: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   primaryBtnDisabled: { opacity: 0.45 },
   primaryBtnText: { color: BTN_TEXT, fontWeight: '900' },
 
-  secondaryBtn: { backgroundColor: CARD, borderWidth: 1, borderColor: BORDER, paddingHorizontal: 10, paddingVertical: 8, borderRadius: 12, marginLeft: 8 },
+  secondaryBtn: {
+    backgroundColor: CARD,
+    borderWidth: 1,
+    borderColor: BORDER,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderRadius: 12,
+    marginLeft: 8,
+  },
   secondaryBtnText: { color: INK, fontWeight: '900', fontSize: 12 },
 
-  dangerBtn: { backgroundColor: '#ffe8ea', borderWidth: 1, borderColor: '#f3b6bf', paddingHorizontal: 10, paddingVertical: 8, borderRadius: 12, marginTop: 8 },
+  dangerBtn: {
+    backgroundColor: '#ffe8ea',
+    borderWidth: 1,
+    borderColor: '#f3b6bf',
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderRadius: 12,
+    marginTop: 8,
+  },
   dangerBtnText: { color: '#7a1b2b', fontWeight: '900', fontSize: 12 },
 
   reviewBtn: { paddingHorizontal: 10, paddingVertical: 8, borderRadius: 12, borderWidth: 1, width: 84, alignItems: 'center' },
@@ -1454,5 +1961,5 @@ const styles = StyleSheet.create({
   reviewBtnText: { color: INK, fontWeight: '900', fontSize: 12 },
   mutedCenter: { color: MUTED, fontWeight: '900' },
 
-  manageTaskRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: BORDER },
+  manageTaskRow: { flexDirection: 'row', alignItems: 'flex-start', paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: BORDER },
 });
