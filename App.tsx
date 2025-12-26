@@ -72,7 +72,7 @@ interface AppState {
 // Storage
 // ------------------------------
 
-const STORAGE_KEY = 'cadence_exec_os_mvp_v2'; // bump key so you can compare behaviors safely
+const STORAGE_KEY = 'cadence_exec_os_mvp_v2';
 
 // ------------------------------
 // Date helpers
@@ -175,6 +175,20 @@ function getCycleForDate(todayISO: string, firstStartISO: string, cadence: Caden
   return { currentIndex: 0, startISO: toISODate(first), endISO: toISODate(addDays(next, -1)) };
 }
 
+// --- Column header ranges (Prev/Current/Next) ---
+
+function cycleRangeISO(firstStartISO: string, cadence: Cadence, index: number) {
+  const start = cadenceIncrement(parseISODate(firstStartISO), cadence, index);
+  const next = cadenceIncrement(start, cadence, 1);
+  const end = addDays(next, -1);
+  return { startISO: toISODate(start), endISO: toISODate(end) };
+}
+
+function cycleRangeHuman(firstStartISO: string, cadence: Cadence, index: number) {
+  const { startISO, endISO } = cycleRangeISO(firstStartISO, cadence, index);
+  return `${formatHumanDate(startISO)}–${formatHumanDate(endISO)}`;
+}
+
 function safeTrim(s: string) {
   return (s || '').trim();
 }
@@ -247,7 +261,7 @@ function ensureTaskCyclesUpTo(
 }
 
 // ------------------------------
-// Onboarding import (Option B)
+// Onboarding import
 // ------------------------------
 
 function buildStateFromOnboarding(onb: OnboardingV1): AppState {
@@ -273,8 +287,6 @@ function buildStateFromOnboarding(onb: OnboardingV1): AppState {
       name: safeTrim(ws.name) || 'Workstream',
       cadence,
       firstCycleStartDate,
-
-      // ✅ capture milestone fields if present
       lead: safeTrim(ws.lead || '') || undefined,
       milestone: safeTrim(ws.milestone || '') || undefined,
       milestoneDate: safeTrim(ws.milestoneDate || '') || undefined,
@@ -349,7 +361,7 @@ function SmallMuted({ children }: { children: React.ReactNode }) {
 
 export default function App() {
   const [state, setState] = useState<AppState | null>(null);
-  const [screen, setScreen] = useState<Screen>('meeting'); // default Meeting
+  const [screen, setScreen] = useState<Screen>('meeting');
   const [cycleOffset, setCycleOffset] = useState<number>(0);
   const [loading, setLoading] = useState(true);
 
@@ -364,8 +376,12 @@ export default function App() {
     toISODate(startOfWeekMonday(new Date()))
   );
 
-  // ✅ if no persisted state, show SetupScreen
+  // Setup
   const [needsSetup, setNeedsSetup] = useState(false);
+
+  // Follow-up capture for Web
+  const [showFollowUpBox, setShowFollowUpBox] = useState(false);
+  const [followUpDraft, setFollowUpDraft] = useState('');
 
   useEffect(() => {
     (async () => {
@@ -434,6 +450,17 @@ export default function App() {
     return `${formatHumanDate(toISODate(start))} – ${formatHumanDate(toISODate(end))}`;
   }, [selectedWorkstream, cycleInfo, viewedCycleIndex]);
 
+  const columnRanges = useMemo(() => {
+    if (!selectedWorkstream) return null;
+    const first = selectedWorkstream.firstCycleStartDate;
+    const cad = selectedWorkstream.cadence;
+
+    const curr = cycleRangeHuman(first, cad, viewedCycleIndex);
+    const next = cycleRangeHuman(first, cad, viewedCycleIndex + 1);
+
+    return { curr, next };
+  }, [selectedWorkstream, viewedCycleIndex]);
+
   // Ensure tasks have cycles up to current index
   useEffect(() => {
     if (!state || !selectedWorkstream || !cycleInfo) return;
@@ -448,7 +475,13 @@ export default function App() {
       changed = true;
       return {
         ...t,
-        cycles: ensureTaskCyclesUpTo(t, t.owner, selectedWorkstream.cadence, selectedWorkstream.firstCycleStartDate, currentIndex),
+        cycles: ensureTaskCyclesUpTo(
+          t,
+          t.owner,
+          selectedWorkstream.cadence,
+          selectedWorkstream.firstCycleStartDate,
+          currentIndex
+        ),
       };
     });
 
@@ -560,10 +593,46 @@ export default function App() {
     setNewTaskOwner('');
   }
 
+  function actuallyAddFollowUp(nameRaw: string) {
+    if (!state || !selectedWorkstream || !cycleInfo) return;
+    const name = safeTrim(nameRaw);
+    if (!name) return;
+
+    const nextIndex = cycleInfo.currentIndex + 1;
+    const owner = 'Unassigned';
+
+    const task: Task = {
+      id: uuid(),
+      workstreamId: selectedWorkstream.id,
+      name,
+      owner,
+      lifecycle: 'active',
+      cycles: [],
+      createdAt: toISODate(new Date()),
+    };
+
+    task.cycles = ensureTaskCyclesUpTo(
+      task,
+      owner,
+      selectedWorkstream.cadence,
+      selectedWorkstream.firstCycleStartDate,
+      nextIndex
+    );
+
+    setState({ ...state, tasks: [...state.tasks, task] });
+  }
+
   function captureFollowUpInMeeting() {
     if (!state || !selectedWorkstream || !cycleInfo) return;
     if (!isMeetingActionsAllowed(screen)) return;
 
+    // Web: show inline input box (Alert.prompt doesn't work on web)
+    if (Platform.OS === 'web') {
+      setShowFollowUpBox(true);
+      return;
+    }
+
+    // iOS: prompt works
     Alert.prompt?.(
       'Capture follow-up',
       'Enter an action item (it will start next period).',
@@ -572,38 +641,16 @@ export default function App() {
         {
           text: 'Add',
           onPress: (text?: string) => {
-
-            const name = safeTrim(text || '');
-            if (!name) return;
-
-            const nextIndex = cycleInfo.currentIndex + 1;
-            const owner = 'Unassigned';
-
-            const task: Task = {
-              id: uuid(),
-              workstreamId: selectedWorkstream.id,
-              name,
-              owner,
-              lifecycle: 'active',
-              cycles: [],
-              createdAt: toISODate(new Date()),
-            };
-            task.cycles = ensureTaskCyclesUpTo(
-              task,
-              owner,
-              selectedWorkstream.cadence,
-              selectedWorkstream.firstCycleStartDate,
-              nextIndex
-            );
-            setState({ ...state, tasks: [...state.tasks, task] });
+            actuallyAddFollowUp(text || '');
           },
         },
       ],
       'plain-text'
     );
 
+    // Android fallback
     if (Platform.OS === 'android') {
-      Alert.alert('Capture follow-up', 'On Android, please add follow-ups in Owners view for now.');
+      Alert.alert('Capture follow-up', 'On Android, please add follow-ups in Pre-meeting view for now.');
     }
   }
 
@@ -631,7 +678,7 @@ export default function App() {
   }
 
   // ------------------------------
-  // Manage actions (reorg-only)
+  // Manage actions
   // ------------------------------
 
   function manageCreateProject() {
@@ -712,7 +759,8 @@ export default function App() {
           <Text style={styles.appTitle}>Cadence</Text>
           <View style={styles.topNavPills}>
             <Pill label="Meeting" active={screen === 'meeting'} onPress={() => setScreen('meeting')} />
-            <Pill label="Owners" active={screen === 'owners'} onPress={() => setScreen('owners')} />
+            {/* Rename label only (keep internal screen key 'owners') */}
+            <Pill label="Pre-meeting" active={screen === 'owners'} onPress={() => setScreen('owners')} />
             <Pill label="Manage" active={screen === 'manage'} onPress={() => setScreen('manage')} />
           </View>
         </View>
@@ -772,11 +820,14 @@ export default function App() {
 
         <View style={styles.periodCenter}>
           <Text style={styles.periodTitle}>
-            {screen === 'meeting' ? 'Weekly Cadence Meeting' : screen === 'owners' ? 'Owner Prep' : 'Manage (Backstage)'}
+            {screen === 'meeting'
+              ? 'Cadence Meeting'
+              : screen === 'owners'
+              ? 'Pre-meeting (Owner prep)'
+              : 'Manage (Backstage)'}
           </Text>
           <Text style={styles.periodSub}>{viewedPeriodLabel}</Text>
 
-          {/* ✅ show milestone context if present */}
           {selectedWorkstream.milestone ? (
             <Text style={styles.periodHint}>
               Milestone: {selectedWorkstream.milestone}
@@ -785,7 +836,7 @@ export default function App() {
           ) : null}
 
           {screen === 'meeting' && cycleOffset === 0 ? (
-            <Text style={styles.periodHint}>Expectation: task owners update before the meeting.</Text>
+            <Text style={styles.periodHint}>Expectation: owners update before the meeting.</Text>
           ) : null}
           {cycleOffset > 0 ? <Text style={styles.periodHint}>Past period (read-only)</Text> : null}
         </View>
@@ -802,12 +853,15 @@ export default function App() {
   }
 
   function renderPPPHeader() {
+    const curr = columnRanges ? ` (${columnRanges.curr})` : '';
+    const next = columnRanges ? ` (${columnRanges.next})` : '';
+
     return (
       <View style={styles.pppHeader}>
         <Text style={[styles.pppCol, styles.pppCol1]}>Item / Owner</Text>
-        <Text style={[styles.pppCol, styles.pppCol2]}>What we said</Text>
-        <Text style={[styles.pppCol, styles.pppCol3]}>What happened</Text>
-        <Text style={[styles.pppCol, styles.pppCol4]}>What’s next</Text>
+        <Text style={[styles.pppCol, styles.pppCol2]}>What we said{curr}</Text>
+        <Text style={[styles.pppCol, styles.pppCol3]}>What happened{curr}</Text>
+        <Text style={[styles.pppCol, styles.pppCol4]}>What’s next{next}</Text>
         {screen === 'meeting' ? <Text style={[styles.pppCol, styles.pppCol5]}>Reviewed</Text> : null}
       </View>
     );
@@ -818,10 +872,19 @@ export default function App() {
     const isPast = cycleOffset > 0;
     const isCurrent = cycleOffset === 0;
 
-    const canEditFields = isOwnerEditAllowed(screen) && isCurrent && task.lifecycle === 'active';
+    // Owner-edit allowed only in Pre-meeting AND only for current cycle.
+    const canEditOwners = isOwnerEditAllowed(screen) && isCurrent && task.lifecycle === 'active';
+
+    // Soft-edit allowed in Meeting for Actuals + Next (current cycle only), but NOT Previous Plan.
+    const canSoftEditMeeting = screen === 'meeting' && isCurrent && task.lifecycle === 'active';
+
     const actualsMissing = safeTrim(cycle?.actuals || '').length === 0;
     const nextMissing = safeTrim(cycle?.nextPlan || '').length === 0;
-    const showNotUpdated = screen === 'meeting' && isCurrent && task.lifecycle === 'active' && (actualsMissing || nextMissing);
+    const showNotUpdated =
+      screen === 'meeting' && isCurrent && task.lifecycle === 'active' && (actualsMissing || nextMissing);
+
+    const canEditActuals = canEditOwners || canSoftEditMeeting;
+    const canEditNext = canEditOwners || canSoftEditMeeting;
 
     return (
       <View key={task.id} style={[styles.row, task.lifecycle !== 'active' ? styles.rowInactive : null]}>
@@ -837,11 +900,11 @@ export default function App() {
         </View>
 
         <View style={styles.cell3}>
-          {canEditFields ? (
+          {canEditActuals ? (
             <TextInput
               value={cycle?.actuals || ''}
               onChangeText={(t) => updateCycleField(task.id, viewedCycleIndex, { actuals: t })}
-              placeholder="Owner update…"
+              placeholder={screen === 'meeting' ? 'Soft edit…' : 'Owner update…'}
               style={styles.textArea}
               multiline
             />
@@ -851,11 +914,11 @@ export default function App() {
         </View>
 
         <View style={styles.cell4}>
-          {canEditFields ? (
+          {canEditNext ? (
             <TextInput
               value={cycle?.nextPlan || ''}
               onChangeText={(t) => updateCycleField(task.id, viewedCycleIndex, { nextPlan: t })}
-              placeholder="Owner plan…"
+              placeholder={screen === 'meeting' ? 'Soft edit…' : 'Owner plan…'}
               style={styles.textArea}
               multiline
             />
@@ -873,9 +936,7 @@ export default function App() {
             ) : (
               <Pressable
                 style={[styles.reviewBtn, cycle?.reviewed ? styles.reviewBtnOn : styles.reviewBtnOff]}
-                onPress={() =>
-                  updateCycleField(task.id, viewedCycleIndex, { reviewed: !cycle?.reviewed })
-                }
+                onPress={() => updateCycleField(task.id, viewedCycleIndex, { reviewed: !cycle?.reviewed })}
               >
                 <Text style={styles.reviewBtnText}>{cycle?.reviewed ? 'Reviewed' : 'Mark'}</Text>
               </Pressable>
@@ -917,17 +978,55 @@ export default function App() {
                 )}
               </View>
 
-              <View style={{ alignItems: 'flex-end' }}>
+              <View style={{ alignItems: 'flex-end', minWidth: 240 }}>
                 <Pressable style={styles.captureBtn} onPress={captureFollowUpInMeeting}>
                   <Text style={styles.captureBtnText}>＋ Capture follow-up</Text>
                 </Pressable>
                 <SmallMuted>Starts next period</SmallMuted>
+
+                {/* Web-only follow-up capture box */}
+                {Platform.OS === 'web' && showFollowUpBox ? (
+                  <View style={styles.followUpBox}>
+                    <TextInput
+                      value={followUpDraft}
+                      onChangeText={setFollowUpDraft}
+                      placeholder="Type follow-up…"
+                      style={styles.followUpInput}
+                    />
+                    <View style={styles.followUpRow}>
+                      <Pressable
+                        style={[
+                          styles.primaryBtn,
+                          safeTrim(followUpDraft).length === 0 ? styles.primaryBtnDisabled : null,
+                        ]}
+                        disabled={safeTrim(followUpDraft).length === 0}
+                        onPress={() => {
+                          actuallyAddFollowUp(followUpDraft);
+                          setFollowUpDraft('');
+                          setShowFollowUpBox(false);
+                        }}
+                      >
+                        <Text style={styles.primaryBtnText}>Add</Text>
+                      </Pressable>
+                      <Pressable
+                        style={styles.secondaryBtn}
+                        onPress={() => {
+                          setFollowUpDraft('');
+                          setShowFollowUpBox(false);
+                        }}
+                      >
+                        <Text style={styles.secondaryBtnText}>Cancel</Text>
+                      </Pressable>
+                    </View>
+                  </View>
+                ) : null}
               </View>
             </View>
           ) : null}
 
           <SmallMuted>
-            Meeting actions: mark items reviewed, then close the period. Reorganization happens in Manage.
+            Meeting actions: mark items reviewed, soft-edit Actuals/Next if needed, then close the period. Reorg happens
+            in Manage.
           </SmallMuted>
         </Card>
 
@@ -981,10 +1080,8 @@ export default function App() {
     return (
       <>
         <Card>
-          <Text style={styles.h2}>Owner expectations</Text>
-          <SmallMuted>
-            Owners update “What happened” + “What’s next” before the meeting. Reorganization is only available in Manage.
-          </SmallMuted>
+          <Text style={styles.h2}>Pre-meeting expectations</Text>
+          <SmallMuted>Owners update “What happened” + “What’s next” before the meeting. Reorg is only in Manage.</SmallMuted>
         </Card>
 
         <Card>
@@ -1030,9 +1127,7 @@ export default function App() {
       <>
         <Card>
           <Text style={styles.h2}>Manage (Backstage)</Text>
-          <SmallMuted>
-            Reorganization happens only here: rename, owner changes, retire/reactivate, workstream creation.
-          </SmallMuted>
+          <SmallMuted>Reorganization happens only here: rename, owner changes, retire/reactivate, workstream creation.</SmallMuted>
           <View style={{ marginTop: 10 }}>
             <Pressable style={styles.dangerBtn} onPress={manageResetToSetup}>
               <Text style={styles.dangerBtnText}>Reset / run Setup Wizard</Text>
@@ -1104,7 +1199,6 @@ export default function App() {
                   Alert.prompt?.('Rename task', 'New name:', [
                     { text: 'Cancel', style: 'cancel' },
                     { text: 'Save', onPress: (text?: string) => manageRenameTask(t.id, text || '') },
-
                   ]);
                   if (Platform.OS === 'android') Alert.alert('Rename', 'Android: rename prompt not available in this MVP.');
                 }}
@@ -1118,7 +1212,6 @@ export default function App() {
                   Alert.prompt?.('Change owner', 'Owner name:', [
                     { text: 'Cancel', style: 'cancel' },
                     { text: 'Save', onPress: (text?: string) => manageChangeOwner(t.id, text || '') },
-
                   ]);
                   if (Platform.OS === 'android') Alert.alert('Owner', 'Android: owner prompt not available in this MVP.');
                 }}
@@ -1163,7 +1256,6 @@ export default function App() {
     );
   }
 
-  // ✅ show SetupScreen when needed
   if (needsSetup || !state) {
     return (
       <SafeAreaView style={[styles.safe, { padding: 12 }]}>
@@ -1189,18 +1281,26 @@ export default function App() {
 }
 
 // ------------------------------
-// Styles (same visual language as Dec21)
+// Styles (NEWSPAPER feel: warm light background, dark ink)
 // ------------------------------
 
-const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: '#0b0b0c' },
-  container: { padding: 12, gap: 12 },
+const PAPER = '#fbf6ea';
+const INK = '#1b1b1e';
+const MUTED = '#5b5b66';
+const BORDER = '#e6dcc7';
+const CARD = '#fffdf6';
+const SOFT = '#f3ead6';
+const BTN = '#1b1b1e';
+const BTN_TEXT = '#fbf6ea';
 
+const styles = StyleSheet.create({
+  safe: { flex: 1, backgroundColor: PAPER },
+  container: { padding: 12, gap: 12 },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center' },
 
-  appTitle: { color: '#fff', fontSize: 18, fontWeight: '700' },
+  appTitle: { color: INK, fontSize: 18, fontWeight: '700' },
 
-  topNav: { padding: 12, paddingTop: 10, backgroundColor: '#0b0b0c', borderBottomWidth: 1, borderBottomColor: '#1f1f22' },
+  topNav: { padding: 12, paddingTop: 10, backgroundColor: PAPER, borderBottomWidth: 1, borderBottomColor: BORDER },
   topNavRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 10 },
   topNavPills: { flexDirection: 'row', gap: 8 },
 
@@ -1208,52 +1308,72 @@ const styles = StyleSheet.create({
   scopeBlock: { gap: 6 },
   inlineRow: { flexDirection: 'row', gap: 8, alignItems: 'center' },
 
-  pill: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 999 },
-  pillActive: { backgroundColor: '#ffffff' },
-  pillInactive: { backgroundColor: '#151518' },
-  pillText: { fontSize: 13, fontWeight: '600' },
-  pillTextActive: { color: '#0b0b0c' },
-  pillTextInactive: { color: '#e6e6e6' },
+  pill: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 999, borderWidth: 1 },
+  pillActive: { backgroundColor: INK, borderColor: INK },
+  pillInactive: { backgroundColor: CARD, borderColor: BORDER },
+  pillText: { fontSize: 13, fontWeight: '700' },
+  pillTextActive: { color: BTN_TEXT },
+  pillTextInactive: { color: INK },
 
-  card: { backgroundColor: '#111114', borderRadius: 16, padding: 12, borderWidth: 1, borderColor: '#222228' },
+  card: { backgroundColor: CARD, borderRadius: 16, padding: 12, borderWidth: 1, borderColor: BORDER },
 
   sectionHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-end', marginBottom: 8 },
-  sectionTitle: { color: '#fff', fontSize: 15, fontWeight: '700' },
+  sectionTitle: { color: INK, fontSize: 15, fontWeight: '800' },
 
-  h1: { color: '#fff', fontSize: 18, fontWeight: '800' },
-  h2: { color: '#fff', fontSize: 16, fontWeight: '800' },
-  h3: { color: '#fff', fontSize: 14, fontWeight: '800', marginTop: 6, marginBottom: 6 },
+  h1: { color: INK, fontSize: 18, fontWeight: '900' },
+  h2: { color: INK, fontSize: 16, fontWeight: '900' },
+  h3: { color: INK, fontSize: 14, fontWeight: '900', marginTop: 6, marginBottom: 6 },
 
-  smallMuted: { color: '#a6a6ad', fontSize: 12, lineHeight: 16 },
-  helpText: { color: '#a6a6ad', fontSize: 12, marginTop: 8 },
+  smallMuted: { color: MUTED, fontSize: 12, lineHeight: 16 },
+  helpText: { color: MUTED, fontSize: 12, marginTop: 8 },
 
   periodNav: { flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 4 },
-  navBtn: { width: 42, height: 42, borderRadius: 12, alignItems: 'center', justifyContent: 'center', backgroundColor: '#151518', borderWidth: 1, borderColor: '#2a2a31' },
+  navBtn: {
+    width: 42,
+    height: 42,
+    borderRadius: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: CARD,
+    borderWidth: 1,
+    borderColor: BORDER,
+  },
   navBtnDisabled: { opacity: 0.4 },
-  navBtnText: { color: '#fff', fontSize: 16, fontWeight: '800' },
+  navBtnText: { color: INK, fontSize: 16, fontWeight: '900' },
   periodCenter: { flex: 1, alignItems: 'center', gap: 2 },
-  periodTitle: { color: '#fff', fontSize: 16, fontWeight: '800' },
-  periodSub: { color: '#d4d4d8', fontSize: 13, fontWeight: '600' },
-  periodHint: { color: '#a6a6ad', fontSize: 12 },
+  periodTitle: { color: INK, fontSize: 16, fontWeight: '900' },
+  periodSub: { color: INK, fontSize: 13, fontWeight: '700' },
+  periodHint: { color: MUTED, fontSize: 12 },
 
   readinessRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12, marginBottom: 8 },
-  readinessText: { color: '#e9e9ee', fontSize: 13, marginTop: 4 },
-  readinessWarn: { color: '#ffd08a', fontSize: 13, marginTop: 2, fontWeight: '700' },
-  readinessOk: { color: '#b8f7c7', fontSize: 13, marginTop: 2, fontWeight: '700' },
+  readinessText: { color: INK, fontSize: 13, marginTop: 4 },
+  readinessWarn: { color: '#8a4b00', fontSize: 13, marginTop: 2, fontWeight: '900' },
+  readinessOk: { color: '#1f6f3f', fontSize: 13, marginTop: 2, fontWeight: '900' },
   bold: { fontWeight: '900' },
 
-  captureBtn: { backgroundColor: '#151518', borderWidth: 1, borderColor: '#2a2a31', borderRadius: 12, paddingHorizontal: 10, paddingVertical: 8 },
-  captureBtnText: { color: '#fff', fontWeight: '800' },
+  captureBtn: { backgroundColor: INK, borderRadius: 12, paddingHorizontal: 10, paddingVertical: 8, marginTop: 2 },
+  captureBtnText: { color: BTN_TEXT, fontWeight: '900' },
 
-  pppHeader: { flexDirection: 'row', paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: '#23232a' },
-  pppCol: { color: '#a6a6ad', fontSize: 12, fontWeight: '800' },
+  followUpBox: { marginTop: 10, width: 260 },
+  followUpInput: {
+    padding: 10,
+    borderRadius: 12,
+    backgroundColor: PAPER,
+    borderWidth: 1,
+    borderColor: BORDER,
+    color: INK,
+  },
+  followUpRow: { flexDirection: 'row', gap: 8, marginTop: 8, justifyContent: 'flex-end' },
+
+  pppHeader: { flexDirection: 'row', paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: BORDER },
+  pppCol: { color: MUTED, fontSize: 12, fontWeight: '900' },
   pppCol1: { flex: 1.0, paddingRight: 8 },
   pppCol2: { flex: 1.4, paddingRight: 8 },
   pppCol3: { flex: 1.4, paddingRight: 8 },
   pppCol4: { flex: 1.4, paddingRight: 8 },
   pppCol5: { width: 92, textAlign: 'center' },
 
-  row: { flexDirection: 'row', paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: '#1f1f22' },
+  row: { flexDirection: 'row', paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: BORDER },
   rowInactive: { opacity: 0.55 },
 
   cell1: { flex: 1.0, paddingRight: 8, gap: 4 },
@@ -1262,24 +1382,46 @@ const styles = StyleSheet.create({
   cell4: { flex: 1.4, paddingRight: 8 },
   cell5: { width: 92, alignItems: 'center', justifyContent: 'center' },
 
-  taskName: { color: '#fff', fontSize: 13, fontWeight: '800' },
-  taskMeta: { color: '#a6a6ad', fontSize: 12, fontWeight: '600' },
+  taskName: { color: INK, fontSize: 13, fontWeight: '900' },
+  taskMeta: { color: MUTED, fontSize: 12, fontWeight: '700' },
 
-  badgeWarn: { alignSelf: 'flex-start', backgroundColor: '#2a2318', borderWidth: 1, borderColor: '#5b431f', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 999, color: '#ffd08a', fontSize: 11, fontWeight: '800' },
-  badgeMuted: { alignSelf: 'flex-start', backgroundColor: '#151518', borderWidth: 1, borderColor: '#2a2a31', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 999, color: '#bdbdc6', fontSize: 11, fontWeight: '800' },
+  badgeWarn: {
+    alignSelf: 'flex-start',
+    backgroundColor: SOFT,
+    borderWidth: 1,
+    borderColor: BORDER,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 999,
+    color: '#8a4b00',
+    fontSize: 11,
+    fontWeight: '900',
+  },
+  badgeMuted: {
+    alignSelf: 'flex-start',
+    backgroundColor: SOFT,
+    borderWidth: 1,
+    borderColor: BORDER,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 999,
+    color: MUTED,
+    fontSize: 11,
+    fontWeight: '900',
+  },
 
-  lockedText: { color: '#d4d4d8', fontSize: 12, lineHeight: 16 },
-  plainText: { color: '#ffffff', fontSize: 12, lineHeight: 16 },
+  lockedText: { color: INK, fontSize: 12, lineHeight: 16 },
+  plainText: { color: INK, fontSize: 12, lineHeight: 16 },
 
   textArea: {
     minHeight: 48,
     maxHeight: 160,
     padding: 8,
     borderRadius: 12,
-    backgroundColor: '#0e0e10',
+    backgroundColor: PAPER,
     borderWidth: 1,
-    borderColor: '#26262d',
-    color: '#fff',
+    borderColor: BORDER,
+    color: INK,
     fontSize: 12,
     lineHeight: 16,
   },
@@ -1288,29 +1430,29 @@ const styles = StyleSheet.create({
     flex: 1,
     padding: 10,
     borderRadius: 12,
-    backgroundColor: '#0e0e10',
+    backgroundColor: PAPER,
     borderWidth: 1,
-    borderColor: '#26262d',
-    color: '#fff',
+    borderColor: BORDER,
+    color: INK,
   },
 
   formRow: { flexDirection: 'row', gap: 10, alignItems: 'center', marginTop: 8, marginBottom: 8 },
 
-  primaryBtn: { backgroundColor: '#ffffff', paddingHorizontal: 12, paddingVertical: 10, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
+  primaryBtn: { backgroundColor: INK, paddingHorizontal: 12, paddingVertical: 10, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
   primaryBtnDisabled: { opacity: 0.45 },
-  primaryBtnText: { color: '#0b0b0c', fontWeight: '900' },
+  primaryBtnText: { color: BTN_TEXT, fontWeight: '900' },
 
-  secondaryBtn: { backgroundColor: '#151518', borderWidth: 1, borderColor: '#2a2a31', paddingHorizontal: 10, paddingVertical: 8, borderRadius: 12, marginLeft: 8 },
-  secondaryBtnText: { color: '#fff', fontWeight: '800', fontSize: 12 },
+  secondaryBtn: { backgroundColor: CARD, borderWidth: 1, borderColor: BORDER, paddingHorizontal: 10, paddingVertical: 8, borderRadius: 12, marginLeft: 8 },
+  secondaryBtnText: { color: INK, fontWeight: '900', fontSize: 12 },
 
-  dangerBtn: { backgroundColor: '#2a1416', borderWidth: 1, borderColor: '#5b1f25', paddingHorizontal: 10, paddingVertical: 8, borderRadius: 12, marginTop: 8 },
-  dangerBtnText: { color: '#ffb4bd', fontWeight: '900', fontSize: 12 },
+  dangerBtn: { backgroundColor: '#ffe8ea', borderWidth: 1, borderColor: '#f3b6bf', paddingHorizontal: 10, paddingVertical: 8, borderRadius: 12, marginTop: 8 },
+  dangerBtnText: { color: '#7a1b2b', fontWeight: '900', fontSize: 12 },
 
   reviewBtn: { paddingHorizontal: 10, paddingVertical: 8, borderRadius: 12, borderWidth: 1, width: 84, alignItems: 'center' },
-  reviewBtnOn: { backgroundColor: '#122016', borderColor: '#255b31' },
-  reviewBtnOff: { backgroundColor: '#151518', borderColor: '#2a2a31' },
-  reviewBtnText: { color: '#fff', fontWeight: '900', fontSize: 12 },
-  mutedCenter: { color: '#a6a6ad', fontWeight: '800' },
+  reviewBtnOn: { backgroundColor: '#e6f3ea', borderColor: '#9fd0ae' },
+  reviewBtnOff: { backgroundColor: CARD, borderColor: BORDER },
+  reviewBtnText: { color: INK, fontWeight: '900', fontSize: 12 },
+  mutedCenter: { color: MUTED, fontWeight: '900' },
 
-  manageTaskRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: '#1f1f22' },
+  manageTaskRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: BORDER },
 });
